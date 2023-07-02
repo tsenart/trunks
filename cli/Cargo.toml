@@ -1,0 +1,25 @@
+[package]
+name                   = "trunks-cli"
+version                = "0.1.0"
+authors.workspace      = true
+edition.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+license.workspace      = true
+rust-version.workspace = true
+publish.workspace      = true
+
+[[bin]]
+name = "trunks"
+path = "src/main.rs"
+
+[dependencies]
+trunks = { path = "../lib" }
+
+async-trait      = { workspace = true }
+clap             = { workspace = true, features = ["default", "derive", "env" ]}
+duration-string  = { workspace = true }
+eyre             = { workspace = true, features = ["default"]}
+futures          = { workspace = true }
+reqwest            = { workspace = true, features = ["rustls", "cookies", "gzip", "brotli", "deflate", "json", "multipart", "stream"] }
+tokio            = { workspace = true, features = ["fs", "io-util", "io-std"]}
