@@ -12,8 +12,10 @@ publish.workspace      = true
 [dependencies]
 async-channel      = { workspace = true }
 async-trait        = { workspace = true }
+base64-simd        = { workspace = true, features = ["alloc", "detect"]}
 csv                = { workspace = true }
 eyre               = { workspace = true }
+humantime-serde    = { workspace = true }
 futures            = { workspace = true, features = ["std"] }
 reqwest            = { workspace = true, features = ["rustls", "cookies", "gzip", "brotli", "deflate", "json", "multipart", "stream"] }
 serde              = { workspace = true, features = ["serde_derive"]}

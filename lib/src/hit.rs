@@ -11,11 +11,14 @@ pub struct Hit {
     pub attack: String,
     pub seq: u64,
     pub code: u16,
+    #[serde(with = "humantime_serde")]
     pub timestamp: SystemTime,
+    #[serde(with = "duration_as_nanos")]
     pub latency: Duration,
     // pub bytes_out: u64,
     // pub bytes_in: u64,
     // pub error: String,
+    #[serde(with = "bytes_as_base64")]
     pub body: Vec<u8>,
     pub method: String,
     pub url: String,
@@ -68,3 +71,45 @@ impl Codec for JsonCodec {
 //         })
 //     }
 // }
+
+mod duration_as_nanos {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let nanos = duration.as_nanos() as u64;
+        serializer.serialize_u64(nanos)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let nanos = u64::deserialize(deserializer)?;
+        Ok(Duration::from_nanos(nanos))
+    }
+}
+
+mod bytes_as_base64 {
+    use base64_simd::STANDARD;
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode_to_string(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode_to_vec(&s).map_err(D::Error::custom)
+    }
+}
