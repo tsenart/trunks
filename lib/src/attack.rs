@@ -1,5 +1,7 @@
 use futures::Stream;
-use reqwest::Client;
+use hyper::client::HttpConnector;
+use hyper::Client;
+use hyper_rustls::HttpsConnector;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -15,7 +17,7 @@ use crate::target::{Target, TargetRead, Targets};
 #[derive(Debug)]
 pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub name: String,
-    pub client: Client,
+    pub client: Client<HttpsConnector<HttpConnector>>,
     pub duration: Duration,
     pub pacer: Arc<P>,
     pub targets: Arc<Mutex<Targets<R>>>,
@@ -51,7 +53,7 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
     name: String,
-    client: reqwest::Client,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
     send: async_channel::Sender<eyre::Result<Hit>>,
 ) {
     let mut count: u64 = 0;
@@ -100,11 +102,11 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
 
 async fn hit(
     attack: String,
-    client: reqwest::Client,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
     seq: u64,
     target: Target,
 ) -> eyre::Result<Hit> {
-    let req = target.request()?;
+    let req = target.request();
     let timestamp = SystemTime::now();
     let began = Instant::now();
     let res = client.execute(req).await?;
@@ -118,6 +120,9 @@ async fn hit(
         code,
         timestamp,
         latency,
+        bytes_out: 0,
+        bytes_in: 1,
+        error: Some(""),
         body,
         method: target.method.to_string(),
         url: target.url.to_string(),

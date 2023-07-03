@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Error as IoError;
@@ -10,54 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Target {
-    pub method: String,
-    pub url: String,
-    pub body: Option<String>,
-    pub header: Option<HashMap<String, Vec<String>>>,
-}
-
-impl Target {
-    pub fn new(
-        method: String,
-        url: String,
-        body: Option<String>,
-        header: Option<HashMap<String, Vec<String>>>,
-    ) -> Self {
-        Self {
-            method,
-            url,
-            body,
-            header,
-        }
-    }
-}
-
-impl Target {
-    pub fn request(&self) -> Result<reqwest::Request> {
-        let url = reqwest::Url::parse(&self.url)?;
-        let method = reqwest::Method::from_str(&self.method)?;
-        let mut req = reqwest::Request::new(method, url);
-
-        if let Some(headers) = &self.header {
-            let headers_map = req.headers_mut();
-            for (k, v) in headers.iter() {
-                for header_value in v {
-                    let header_name = reqwest::header::HeaderName::from_bytes(k.as_bytes())?;
-                    let header_value = reqwest::header::HeaderValue::from_str(header_value)?;
-                    headers_map.insert(header_name, header_value);
-                }
-            }
-        }
-
-        // if let Some(body) = &self.body {
-        //     req.body_mut()
-        //         .and_then(|b| b.as_bytes().and_then(|b2| Some(())));
-        // }
-
-        Ok(req)
-    }
+    pub req: hyper::Request<Vec<u8>>,
 }
 
 #[async_trait]
@@ -102,10 +58,16 @@ impl<'a, R: AsyncBufRead + Send> TargetRead<R> for Targets<R> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TargetDefaults {
+    pub headers: HashMap<String, Vec<String>>,
+    pub body: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TargetReader<R: AsyncBufRead> {
-    Json(Pin<Box<R>>),
-    Http(Pin<Box<R>>),
+    Json(Pin<Box<(R, TargetDefaults)>>),
+    Http(Pin<Box<(R, TargetDefaults)>>),
 }
 
 impl<R: AsyncBufRead> TargetReader<R> {
@@ -122,14 +84,15 @@ impl<R: AsyncBufRead> TargetReader<R> {
 impl<R: AsyncBufRead + Send> TargetRead<R> for TargetReader<R> {
     async fn decode(&mut self, target: &mut Target) -> Result<()> {
         match self {
-            TargetReader::Json(source) => decode_json(source, target).await,
-            TargetReader::Http(source) => decode_http(source, target).await,
+            TargetReader::Json(source, defaults) => decode_json(source, defaults, target).await,
+            TargetReader::Http(source, defaults) => decode_http(source, defaults, target).await,
         }
     }
 }
 
 async fn decode_json<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
+    defaults: &TargetDefaults,
     target: &mut Target,
 ) -> Result<()> {
     let mut line = String::new();
@@ -137,111 +100,79 @@ async fn decode_json<R: AsyncBufReadExt + Unpin>(
     reader.read_line(&mut line).await?;
 
     if line.is_empty() {
-        return Err(IoError::new(std::io::ErrorKind::Other, "no targets to attack").into());
+        eyre::bail!("no targets to attack");
     }
 
-    let t: Target = serde_json::from_str(&line)?;
+    let t: Value = serde_json::from_str(&line)?;
 
-    if t.method.is_empty() {
-        return Err(IoError::new(
-            std::io::ErrorKind::Other,
-            "target: required method is missing",
-        )
-        .into());
-    }
+    let method = match t["method"] {
+        Value::String(method) => hyper::Method::from_str(&method)?,
+        _ => eyre::bail!("target: valid method is missing"),
+    };
 
-    if t.url.is_empty() {
-        return Err(
-            IoError::new(std::io::ErrorKind::Other, "target: required url is missing").into(),
-        );
-    }
+    let url = match t["url"] {
+        Value::String(url) => hyper::Uri::from_str(&url)?,
+        _ => eyre::bail!("target: valid url is missing"),
+    };
 
-    if t.body.is_none() && target.body.is_some() {
-        target.body = t.body;
-    }
-
-    if target.header.is_none() {
-        target.header = t.header;
-    }
+    let body = match t["body"] {
+        Value::String(body) => body.as_bytes().to_vec(),
+        _ => defaults.body.clone(),
+    };
 
     Ok(())
 }
 
-pub async fn decode_http<R: AsyncBufReadExt + Unpin>(
+async fn decode_http<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
+    defaults: &TargetDefaults,
     target: &mut Target,
-) -> Result<()> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut line = String::new();
 
-    reader.read_line(&mut line).await?;
-
-    if line.is_empty() {
-        return Err(IoError::new(std::io::ErrorKind::Other, "no targets to attack").into());
-    }
-
-    let tokens: Vec<&str> = line.trim().split(' ').collect();
-
-    if tokens.len() != 2 {
-        return Err(IoError::new(
-            std::io::ErrorKind::Other,
-            "invalid request: format should be [METHOD] [URL]",
-        )
-        .into());
-    }
-
-    target.method = tokens[0].to_string();
-    target.url = tokens[1].to_string();
-
-    // Handle HTTP Headers
-    let mut headers = HashMap::new();
-    loop {
-        line.clear();
-        reader.read_line(&mut line).await?;
-
-        if line.trim().is_empty() {
+    // Skip empty lines or comments
+    while reader.read_line(&mut line).await? > 0 {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
             break;
         }
-
-        let header_tokens: Vec<&str> = line.splitn(2, ":").collect();
-
-        if header_tokens.len() != 2 {
-            return Err(IoError::new(
-                std::io::ErrorKind::Other,
-                "invalid header: format should be [Key]: [Value]",
-            )
-            .into());
-        }
-
-        let header_name = header_tokens[0].trim().to_string();
-        let header_value = header_tokens[1].trim().to_string();
-
-        headers
-            .entry(header_name)
-            .or_insert(vec![])
-            .push(header_value);
+        line.clear();
     }
 
-    if headers.is_empty() {
-        target.header = Some(headers);
+    // Parse method and uri
+    let tokens: Vec<&str> = line.splitn(2, ' ').collect();
+    if tokens.len() != 2 {
+        eyre::bail!("bad target: {}", line);
     }
 
-    // Handle HTTP Body
+    let method = hyper::Method::from_str(tokens[0])?.map_err(|e| {
+        eyre::bail!("bad method: {}", tokens[0]);
+    });
+
+    let mut req = hyper::Request::builder().method(method).uri(tokens[1]);
+    let mut body: Vec<u8> = defaults.body.clone();
+
+    for (k, v) in defaults.headers.iter() {
+        req = req.header(k, v);
+    }
+
+    // Parse headers and body
     line.clear();
-    reader.read_line(&mut line).await?;
-    let body_line = line.trim().to_string();
-
-    if !body_line.is_empty() {
-        if body_line.starts_with('@') {
-            // The line starts with @, so treat the rest of the line as a filename to read from
-            let file_path = body_line.trim_start_matches('@');
-            match fs::read_to_string(file_path) {
-                Ok(file_content) => target.body = Some(file_content),
-                Err(e) => return Err(e.into()),
-            }
-        } else {
-            // If the line does not start with @, just use it as the body
-            target.body = Some(body_line);
+    while reader.read_line(&mut line).await? > 0 {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
         }
+        if trimmed.starts_with('@') {
+            body = tokio::fs::read(&trimmed[1..]).await?;
+            break;
+        }
+        let tokens: Vec<&str> = line.splitn(2, ':').collect();
+        if tokens.len() != 2 {
+            eyre::bail!("bad header: {}", line);
+        }
+        req = req.header(tokens[0].trim(), tokens[1].trim());
+        line.clear();
     }
 
     Ok(())

@@ -15,9 +15,9 @@ pub struct Hit {
     pub timestamp: SystemTime,
     #[serde(with = "duration_as_nanos")]
     pub latency: Duration,
-    // pub bytes_out: u64,
-    // pub bytes_in: u64,
-    // pub error: String,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    pub error: String,
     #[serde(with = "bytes_as_base64")]
     pub body: Vec<u8>,
     pub method: String,

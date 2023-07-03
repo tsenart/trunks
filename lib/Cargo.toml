@@ -17,9 +17,10 @@ csv                = { workspace = true }
 eyre               = { workspace = true }
 humantime-serde    = { workspace = true }
 futures            = { workspace = true, features = ["std"] }
-reqwest            = { workspace = true, features = ["rustls", "cookies", "gzip", "brotli", "deflate", "json", "multipart", "stream"] }
+hyper              = { workspace = true, features = ["client", "http1", "http2", "runtime", "stream"]}
+hyper-rustls       = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
 serde              = { workspace = true, features = ["serde_derive"]}
-serde_json         = { workspace = true }
+serde_json         = { workspace = true, features = ["std"]}
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["full"]}
 tokio-util         = { workspace = true, features = []}
