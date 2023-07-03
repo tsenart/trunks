@@ -1,12 +1,9 @@
 // use csv::ReaderBuilder;
-use serde::{Deserialize, Serialize};
-use serde_json::Deserializer;
-use std::{
-    io::{Read, Write},
-    time::{Duration, SystemTime},
-};
-
+use async_trait::async_trait;
 use eyre::Result;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 // Hit contains the hits of a single Target hit.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -32,21 +29,27 @@ impl Hit {
     }
 }
 
-pub trait Codec<R: Read, W: Write> {
-    fn encode(&self, writer: &mut W, hit: &Hit) -> Result<()>;
-    fn decode(&self, reader: &mut R) -> Result<Hit>;
+#[async_trait]
+pub trait Codec {
+    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()>;
+    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit>;
 }
 
 pub struct JsonCodec;
 
-impl<R: Read, W: Write> Codec<R, W> for JsonCodec {
-    fn encode(&self, writer: &mut W, hit: &Hit) -> Result<()> {
-        serde_json::to_writer(writer, hit).map_err(|e| eyre::eyre!(e))
+#[async_trait]
+impl Codec for JsonCodec {
+    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
+        writer.write_all(&serde_json::to_vec(hit)?).await?;
+        writer.write(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
     }
 
-    fn decode(&self, reader: &mut R) -> Result<Hit> {
-        let mut deserializer = Deserializer::from_reader(reader);
-        Hit::deserialize(&mut deserializer).map_err(|e| eyre::eyre!(e))
+    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
+        let mut buf = Vec::new();
+        reader.read_until(b'\n', &mut buf).await?;
+        serde_json::from_slice(&buf).map_err(|e| eyre::eyre!(e))
     }
 }
 

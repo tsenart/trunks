@@ -1,5 +1,6 @@
 use futures::Stream;
 use reqwest::Client;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tokio::io::AsyncBufRead;
@@ -21,7 +22,7 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
 }
 
 impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
-    pub fn run(&self) -> impl Stream<Item = eyre::Result<Hit>> {
+    pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
         let (send, recv) = async_channel::unbounded::<eyre::Result<Hit>>();
         let duration = self.duration.clone();
         let client = self.client.clone();
@@ -31,7 +32,7 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
 
         tokio::spawn(async move { attack(duration, pacer, targets, name, client, send).await });
 
-        recv
+        Box::pin(recv)
     }
 }
 

@@ -1,7 +1,6 @@
 use clap::Parser;
 use duration_string::DurationString;
 use eyre::Result;
-use futures::pin_mut;
 use futures::StreamExt as _;
 use std::io;
 use std::pin::Pin;
@@ -12,10 +11,13 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::io::BufReader;
+use tokio::io::BufWriter;
 use tokio::io::ReadBuf;
 use tokio::sync::Mutex;
 use trunks::Attack;
+use trunks::Codec;
 use trunks::TargetReader;
 use trunks::Targets;
 use trunks::{Target, TargetRead};
@@ -60,14 +62,15 @@ pub async fn attack(opts: &Opts) -> Result<()> {
     //     eyre::bail!("rate frequency and time unit must be bigger than zero");
     // }
 
-    let targets_source = Reader::from_filename(&opts.targets).await?;
+    let input = Input::from_filename(&opts.targets).await?;
+    let mut output = Output::from_filename(&opts.output).await?;
 
     // let mut body: Vec<u8> = Vec::new();
     // if let Some(body_bytes) = files.get(&opts.body) {
     //     body_bytes.read_to_end(&mut body)?;
     // }
 
-    let mut target_reader = TargetReader::new(&opts.format, targets_source)?;
+    let mut target_reader = TargetReader::new(&opts.format, input)?;
     let targets = if opts.lazy {
         Targets::Lazy(target_reader)
     } else {
@@ -93,59 +96,113 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         targets: Arc::new(Mutex::new(targets)),
     };
 
-    let hits = atk.run();
+    let mut hits = atk.run();
 
-    pin_mut!(hits); // needed for iteration
+    let codec = trunks::JsonCodec {};
 
-    while let Some(_) = hits.next().await {}
+    while let Some(result) = hits.next().await {
+        match result {
+            Ok(hit) => {
+                codec.encode(&mut output, &hit).await?;
+            }
+            Err(err) => {
+                panic!("{}", err)
+                // TODO: Move error to hit, make the returned stream be Stream<Item=Hit>
+            }
+        }
+    }
 
     Ok(())
 }
 
-// All the below stuff is to have better perf with static dispatch.
 #[derive(Debug)]
-enum Reader {
+enum Input {
     Stdin(BufReader<tokio::io::Stdin>),
     File(BufReader<File>),
 }
 
-impl Reader {
+impl Input {
     async fn from_filename(name: &str) -> Result<Self> {
         match name {
-            "stdin" => Ok(Reader::Stdin(BufReader::new(tokio::io::stdin()))),
+            "stdin" => Ok(Input::Stdin(BufReader::new(tokio::io::stdin()))),
             _ => {
                 let f = File::open(name).await?;
-                Ok(Reader::File(BufReader::new(f)))
+                Ok(Input::File(BufReader::new(f)))
             }
         }
     }
 }
 
-impl AsyncRead for Reader {
+impl AsyncRead for Input {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Reader::Stdin(reader) => Pin::new(reader).poll_read(cx, buf),
-            Reader::File(reader) => Pin::new(reader).poll_read(cx, buf),
+            Input::Stdin(reader) => Pin::new(reader).poll_read(cx, buf),
+            Input::File(reader) => Pin::new(reader).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncBufRead for Reader {
+impl AsyncBufRead for Input {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         match self.get_mut() {
-            Reader::Stdin(reader) => Pin::new(reader).poll_fill_buf(cx),
-            Reader::File(reader) => Pin::new(reader).poll_fill_buf(cx),
+            Input::Stdin(reader) => Pin::new(reader).poll_fill_buf(cx),
+            Input::File(reader) => Pin::new(reader).poll_fill_buf(cx),
         }
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
         match self.get_mut() {
-            Reader::Stdin(reader) => Pin::new(reader).consume(amt),
-            Reader::File(reader) => Pin::new(reader).consume(amt),
+            Input::Stdin(reader) => Pin::new(reader).consume(amt),
+            Input::File(reader) => Pin::new(reader).consume(amt),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Output {
+    Stdout(BufWriter<tokio::io::Stdout>),
+    File(BufWriter<File>),
+}
+
+impl Output {
+    async fn from_filename(name: &str) -> Result<Self> {
+        match name {
+            "stdout" => Ok(Output::Stdout(BufWriter::new(tokio::io::stdout()))),
+            _ => {
+                let f = File::open(name).await?;
+                Ok(Output::File(BufWriter::new(f)))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Output {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        match self.get_mut() {
+            Output::Stdout(writer) => Pin::new(writer).poll_write(cx, buf),
+            Output::File(writer) => Pin::new(writer).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        match self.get_mut() {
+            Output::Stdout(writer) => Pin::new(writer).poll_flush(cx),
+            Output::File(writer) => Pin::new(writer).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        match self.get_mut() {
+            Output::Stdout(writer) => Pin::new(writer).poll_shutdown(cx),
+            Output::File(writer) => Pin::new(writer).poll_shutdown(cx),
         }
     }
 }
