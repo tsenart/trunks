@@ -1,5 +1,8 @@
 use futures::Stream;
-use reqwest::Client;
+use hyper::body::to_bytes;
+use hyper::client::HttpConnector;
+use hyper::{Body, Client, Request};
+use hyper_rustls::HttpsConnector;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -15,7 +18,7 @@ use crate::target::{Target, TargetRead, Targets};
 #[derive(Debug)]
 pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub name: String,
-    pub client: Client,
+    pub client: Client<HttpsConnector<HttpConnector>>,
     pub duration: Duration,
     pub pacer: Arc<P>,
     pub targets: Arc<Mutex<Targets<R>>>,
@@ -24,7 +27,7 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
 impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
         let (send, recv) = async_channel::unbounded::<eyre::Result<Hit>>();
-        let duration = self.duration.clone();
+        let duration = self.duration;
         let client = self.client.clone();
         let name = self.name.clone();
         let pacer = self.pacer.clone();
@@ -51,7 +54,7 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
     name: String,
-    client: reqwest::Client,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
     send: async_channel::Sender<eyre::Result<Hit>>,
 ) {
     let mut count: u64 = 0;
@@ -77,9 +80,8 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
         }
 
         count += 1;
-        let mut target: Target = Default::default();
-        match targets.lock().await.decode(&mut target).await {
-            Ok(_) => {
+        match targets.lock().await.decode().await {
+            Ok(target) => {
                 let name = name.clone();
                 let client = client.clone();
                 let send = send.clone();
@@ -100,16 +102,40 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
 
 async fn hit(
     attack: String,
-    client: reqwest::Client,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
     seq: u64,
-    target: Target,
+    target: Arc<Target>,
 ) -> eyre::Result<Hit> {
-    let req = target.request()?;
+    let method = target.method.to_string();
+    let url = target.url.to_string();
     let timestamp = SystemTime::now();
     let began = Instant::now();
-    let res = client.execute(req).await?;
+    let mut req = Request::builder().method(&target.method).uri(&target.url);
+    if let Some(headers) = req.headers_mut() {
+        *headers = target.headers.clone();
+    }
+    let req = req.body(Body::from(target.body.clone()))?;
+    let res = match client.request(req).await {
+        Ok(res) => res,
+        Err(err) => {
+            return Ok(Hit {
+                attack,
+                seq,
+                code: 0,
+                timestamp,
+                latency: began.elapsed(),
+                bytes_out: 0,
+                bytes_in: 0,
+                error: err.to_string(),
+                body: vec![],
+                method,
+                url,
+            })
+        }
+    };
+
     let code = res.status().as_u16();
-    let body = res.bytes().await?.to_vec();
+    let body = to_bytes(res.into_body()).await?.to_vec();
     let latency = began.elapsed();
 
     Ok(Hit {
@@ -118,8 +144,11 @@ async fn hit(
         code,
         timestamp,
         latency,
+        bytes_out: target.body.len() as u64,
+        bytes_in: body.len() as u64,
+        error: String::default(),
         body,
-        method: target.method.to_string(),
-        url: target.url.to_string(),
+        method,
+        url,
     })
 }

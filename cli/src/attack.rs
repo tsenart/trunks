@@ -2,6 +2,7 @@ use clap::Parser;
 use duration_string::DurationString;
 use eyre::Result;
 use futures::StreamExt as _;
+use hyper::Client;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,9 +19,10 @@ use tokio::io::ReadBuf;
 use tokio::sync::Mutex;
 use trunks::Attack;
 use trunks::Codec;
+use trunks::TargetDefaults;
+use trunks::TargetRead;
 use trunks::TargetReader;
 use trunks::Targets;
-use trunks::{Target, TargetRead};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -70,15 +72,20 @@ pub async fn attack(opts: &Opts) -> Result<()> {
     //     body_bytes.read_to_end(&mut body)?;
     // }
 
-    let mut target_reader = TargetReader::new(&opts.format, input)?;
+    let mut target_reader = TargetReader::new(
+        &opts.format,
+        input,
+        TargetDefaults {
+            body: None,
+            headers: None,
+        },
+    )?;
     let targets = if opts.lazy {
         Targets::Lazy(target_reader)
     } else {
         let mut targets: Vec<_> = Vec::new();
-        let mut target = Target::default();
-        while let Ok(_) = target_reader.decode(&mut target).await {
+        while let Ok(target) = target_reader.decode().await {
             targets.push(target);
-            target = Target::default();
         }
         Targets::from(targets)
     };
@@ -88,8 +95,14 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         per: Duration::from_secs(1),
     };
 
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+
     let atk = Attack {
-        client: reqwest::Client::new(),
+        client: Client::builder().build::<_, hyper::Body>(https),
         duration: opts.duration.into(),
         name: opts.name.clone(),
         pacer: Arc::new(pacer),
@@ -107,7 +120,6 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             }
             Err(err) => {
                 panic!("{}", err)
-                // TODO: Move error to hit, make the returned stream be Stream<Item=Hit>
             }
         }
     }

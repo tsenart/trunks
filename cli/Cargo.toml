@@ -21,5 +21,6 @@ clap             = { workspace = true, features = ["default", "derive", "env" ]}
 duration-string  = { workspace = true }
 eyre             = { workspace = true, features = ["default"]}
 futures          = { workspace = true }
-reqwest            = { workspace = true, features = ["rustls", "cookies", "gzip", "brotli", "deflate", "json", "multipart", "stream"] }
+hyper            = { workspace = true, features = ["client", "http1", "http2", "runtime", "stream"]}
+hyper-rustls     = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
 tokio            = { workspace = true, features = ["fs", "io-util", "io-std"]}

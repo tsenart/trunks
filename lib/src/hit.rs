@@ -15,9 +15,9 @@ pub struct Hit {
     pub timestamp: SystemTime,
     #[serde(with = "duration_as_nanos")]
     pub latency: Duration,
-    // pub bytes_out: u64,
-    // pub bytes_in: u64,
-    // pub error: String,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    pub error: String,
     #[serde(with = "bytes_as_base64")]
     pub body: Vec<u8>,
     pub method: String,
@@ -44,7 +44,7 @@ pub struct JsonCodec;
 impl Codec for JsonCodec {
     async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
         writer.write_all(&serde_json::to_vec(hit)?).await?;
-        writer.write(b"\n").await?;
+        writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
     }
@@ -110,6 +110,6 @@ mod bytes_as_base64 {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        STANDARD.decode_to_vec(&s).map_err(D::Error::custom)
+        STANDARD.decode_to_vec(s).map_err(D::Error::custom)
     }
 }

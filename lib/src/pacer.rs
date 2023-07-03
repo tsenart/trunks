@@ -38,7 +38,8 @@ impl Pacer for ConstantPacer {
         if delta > elapsed {
             return (delta - elapsed, false);
         }
-        return (Duration::ZERO, false);
+
+        (Duration::ZERO, false)
     }
 }
 
