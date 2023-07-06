@@ -29,6 +29,8 @@ thiserror          = { version = "1.0",  default-features = false }
 tokio              = { version = "1.28", default-features = false }
 tokio-util         = { version = "0.7",  default-features = false }
 url                = { version = "2.4",  default-features = false }
+num_cpus           = { version = "1.16", default-features = false }
+
 
 [profile.release]
 opt-level = 3

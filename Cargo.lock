@@ -1077,6 +1077,7 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-rustls",
+ "num_cpus",
  "serde",
  "serde_json",
  "thiserror",
@@ -1096,6 +1097,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-rustls",
+ "num_cpus",
  "tokio",
  "trunks",
 ]

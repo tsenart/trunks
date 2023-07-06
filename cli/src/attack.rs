@@ -3,26 +3,16 @@ use duration_string::DurationString;
 use eyre::Result;
 use futures::StreamExt as _;
 use hyper::Client;
+use num_cpus;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncBufRead;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
-use tokio::io::BufReader;
-use tokio::io::BufWriter;
-use tokio::io::ReadBuf;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf};
 use tokio::sync::Mutex;
-use trunks::Attack;
-use trunks::Codec;
-use trunks::TargetDefaults;
-use trunks::TargetRead;
-use trunks::TargetReader;
-use trunks::Targets;
+use trunks::{Attack, Codec, TargetDefaults, TargetRead, TargetReader, Targets};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -57,20 +47,23 @@ pub struct Opts {
     /// Constant requests rate per second
     #[clap(long)]
     rate: usize,
+
+    /// Initial number of workers
+    #[clap(long, default_value_t = num_cpus::get())]
+    workers: usize,
+
+    /// Maximum number of workers
+    #[clap(long, default_value_t = 0)]
+    max_workers: usize,
 }
 
 pub async fn attack(opts: &Opts) -> Result<()> {
-    // if opts.max_workers == 0 && opts.rate == 0 {
-    //     eyre::bail!("rate frequency and time unit must be bigger than zero");
-    // }
+    if opts.max_workers == 0 && opts.rate == 0 {
+        eyre::bail!("-max-workers must be set when -rate is 0");
+    }
 
     let input = Input::from_filename(&opts.targets).await?;
     let mut output = Output::from_filename(&opts.output).await?;
-
-    // let mut body: Vec<u8> = Vec::new();
-    // if let Some(body_bytes) = files.get(&opts.body) {
-    //     body_bytes.read_to_end(&mut body)?;
-    // }
 
     let mut target_reader = TargetReader::new(
         &opts.format,
@@ -80,6 +73,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             headers: None,
         },
     )?;
+
     let targets = if opts.lazy {
         Targets::Lazy(target_reader)
     } else {
@@ -107,6 +101,8 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         name: opts.name.clone(),
         pacer: Arc::new(pacer),
         targets: Arc::new(Mutex::new(targets)),
+        workers: opts.workers,
+        max_workers: opts.max_workers,
     };
 
     let mut hits = atk.run();

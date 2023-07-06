@@ -24,3 +24,4 @@ futures          = { workspace = true }
 hyper            = { workspace = true, features = ["client", "http1", "http2", "runtime", "stream"]}
 hyper-rustls     = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
 tokio            = { workspace = true, features = ["fs", "io-util", "io-std"]}
+num_cpus         = { workspace = true }

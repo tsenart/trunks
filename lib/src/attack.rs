@@ -22,40 +22,52 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub duration: Duration,
     pub pacer: Arc<P>,
     pub targets: Arc<Mutex<Targets<R>>>,
+    pub workers: usize,
+    pub max_workers: usize,
 }
 
 impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
-        let (send, recv) = async_channel::unbounded::<eyre::Result<Hit>>();
-        let duration = self.duration;
-        let client = self.client.clone();
-        let name = self.name.clone();
-        let pacer = self.pacer.clone();
-        let targets = self.targets.clone();
+        let (target_send, target_recv) = async_channel::unbounded::<(u64, Arc<Target>)>();
+        let (hit_send, hit_recv) = async_channel::unbounded::<eyre::Result<Hit>>();
 
-        tokio::spawn(async move { attack(duration, pacer, targets, name, client, send).await });
+        for _ in 0..self.workers {
+            tokio::spawn(worker(
+                target_recv.clone(),
+                hit_send.clone(),
+                self.client.clone(),
+                self.name.clone(),
+            ));
+        }
 
-        Box::pin(recv)
+        tokio::spawn(attack(
+            self.duration,
+            self.pacer.clone(),
+            self.targets.clone(),
+            target_send,
+        ));
+
+        Box::pin(hit_recv)
     }
 }
 
-#[cfg(unix)]
-const MIN_SLEEP: Duration = Duration::from_millis(1);
-
-#[cfg(windows)]
-const MIN_SLEEP: Duration = Duration::from_millis(16);
-
-// For any other OS not specifically handled above, use a safe default
-#[cfg(not(any(unix, windows)))]
-const MIN_SLEEP: Duration = Duration::from_millis(1);
+async fn worker(
+    target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
+    hit_send: async_channel::Sender<eyre::Result<Hit>>,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    name: String,
+) {
+    while let Ok((count, target)) = target_recv.recv().await {
+        let result = hit(name.clone(), client.clone(), count, target).await;
+        let _ = hit_send.send(result).await;
+    }
+}
 
 async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     duration: Duration,
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
-    name: String,
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
-    send: async_channel::Sender<eyre::Result<Hit>>,
+    target_send: async_channel::Sender<(u64, Arc<Target>)>,
 ) {
     let mut count: u64 = 0;
     let began = Instant::now();
@@ -82,23 +94,27 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
         count += 1;
         match targets.lock().await.decode().await {
             Ok(target) => {
-                let name = name.clone();
-                let client = client.clone();
-                let send = send.clone();
-                tokio::spawn(async move {
-                    let result = hit(name, client, count, target).await;
-                    let _ = send.send(result).await;
-                });
+                let _ = target_send.send((count, target)).await;
             }
-
             Err(e) => {
-                let _ = send.send(Err(e)).await;
+                eprintln!("Error decoding target: {}", e);
+                return;
             }
         }
 
         tokio::task::yield_now().await;
     }
 }
+
+#[cfg(unix)]
+const MIN_SLEEP: Duration = Duration::from_millis(1);
+
+#[cfg(windows)]
+const MIN_SLEEP: Duration = Duration::from_millis(16);
+
+// For any other OS not specifically handled above, use a safe default
+#[cfg(not(any(unix, windows)))]
+const MIN_SLEEP: Duration = Duration::from_millis(1);
 
 async fn hit(
     attack: String,
