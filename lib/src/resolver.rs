@@ -347,3 +347,125 @@ impl Service<Name> for TrunksResolver {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_ipv4_no_port() {
+        let addr = normalize_resolver_addr("8.8.8.8").unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn normalize_ipv4_with_port() {
+        let addr = normalize_resolver_addr("8.8.8.8:5353").unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(addr.port(), 5353);
+    }
+
+    #[test]
+    fn normalize_ipv6_no_port() {
+        let addr = normalize_resolver_addr("::1").unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn normalize_ipv6_bracket_port() {
+        let addr = normalize_resolver_addr("[::1]:5353").unwrap();
+        assert_eq!(addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr.port(), 5353);
+    }
+
+    #[test]
+    fn normalize_invalid() {
+        assert!(normalize_resolver_addr("not-an-ip").is_none());
+    }
+
+    #[test]
+    fn build_dns_query_structure() {
+        let q = build_dns_query("example.com", 1);
+        assert!(q.len() > 12);
+        // QDCOUNT = 1
+        assert_eq!(&q[4..6], &[0x00, 0x01]);
+        // ANCOUNT = 0
+        assert_eq!(&q[6..8], &[0x00, 0x00]);
+        // Question: label "example" (len 7)
+        assert_eq!(q[12], 7);
+        assert_eq!(&q[13..20], b"example");
+        // Label "com" (len 3)
+        assert_eq!(q[20], 3);
+        assert_eq!(&q[21..24], b"com");
+        // Root label
+        assert_eq!(q[24], 0);
+        // QTYPE = A (1)
+        assert_eq!(&q[25..27], &[0x00, 0x01]);
+        // QCLASS = IN (1)
+        assert_eq!(&q[27..29], &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn build_dns_query_aaaa() {
+        let q = build_dns_query("test.io", 28);
+        // Find QTYPE at end: after root label (0), next 2 bytes are QTYPE
+        // "test" = 4 bytes + 1 len, "io" = 2 bytes + 1 len, root = 1 byte
+        // offset = 12 + 1+4 + 1+2 + 1 = 21, QTYPE at 21..23
+        assert_eq!(q[21], 0x00);
+        assert_eq!(q[22], 0x1C); // 28
+    }
+
+    #[test]
+    fn parse_dns_response_a_record() {
+        let mut resp = Vec::new();
+        // Header
+        resp.extend_from_slice(&[0x00, 0x01]); // ID
+        resp.extend_from_slice(&[0x81, 0x80]); // Flags
+        resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                               // Question: example.com
+        resp.push(7);
+        resp.extend_from_slice(b"example");
+        resp.push(3);
+        resp.extend_from_slice(b"com");
+        resp.push(0);
+        resp.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+                                               // Answer: compressed pointer to name at offset 12
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL=300
+        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        resp.extend_from_slice(&[1, 2, 3, 4]); // RDATA
+
+        let addrs = parse_dns_response(&resp).unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn parse_dns_response_too_short() {
+        assert!(parse_dns_response(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn skip_dns_name_labels() {
+        let data = [
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        let pos = skip_dns_name(&data, 0).unwrap();
+        assert_eq!(pos, 13);
+    }
+
+    #[test]
+    fn skip_dns_name_compressed() {
+        let data = [0xC0, 0x0C];
+        let pos = skip_dns_name(&data, 0).unwrap();
+        assert_eq!(pos, 2);
+    }
+}

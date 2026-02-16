@@ -313,3 +313,135 @@ pub fn report_hdrplot(m: &Metrics, w: &mut dyn Write) -> eyre::Result<()> {
     tw.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_metrics(hits: &[(u16, u64)]) -> Metrics {
+        let mut m = Metrics::new();
+        for (i, &(code, latency_ms)) in hits.iter().enumerate() {
+            m.add(&Hit {
+                attack: "test".to_string(),
+                seq: i as u64,
+                code,
+                timestamp: std::time::UNIX_EPOCH + Duration::from_secs(i as u64),
+                latency: Duration::from_millis(latency_ms),
+                bytes_out: 10,
+                bytes_in: 100,
+                error: String::new(),
+                body: vec![],
+                method: "GET".to_string(),
+                url: "http://localhost/".to_string(),
+                headers: HashMap::new(),
+            });
+        }
+        m.close();
+        m
+    }
+
+    #[test]
+    fn report_text_contains_sections() {
+        let m = make_metrics(&[(200, 100), (200, 200)]);
+        let mut buf = Vec::new();
+        report_text(&m, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        for section in &[
+            "Requests",
+            "Duration",
+            "Latencies",
+            "Bytes In",
+            "Bytes Out",
+            "Success",
+            "Status Codes",
+            "Error Set",
+        ] {
+            assert!(text.contains(section), "missing section: {}", section);
+        }
+    }
+
+    #[test]
+    fn report_json_round_trips() {
+        let m = make_metrics(&[(200, 100), (200, 200), (500, 50)]);
+        let mut buf = Vec::new();
+        report_json(&m, &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["requests"], 3);
+    }
+
+    #[test]
+    fn report_histogram_buckets() {
+        let mut h = Histogram::new(vec![
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        ]);
+        let hits = [
+            Duration::from_micros(500),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        ];
+        for lat in &hits {
+            h.add(&Hit {
+                attack: "test".to_string(),
+                seq: 0,
+                code: 200,
+                timestamp: std::time::UNIX_EPOCH,
+                latency: *lat,
+                bytes_out: 0,
+                bytes_in: 0,
+                error: String::new(),
+                body: vec![],
+                method: "GET".to_string(),
+                url: "http://localhost/".to_string(),
+                headers: HashMap::new(),
+            });
+        }
+        assert_eq!(h.total, 4);
+        let mut buf = Vec::new();
+        report_histogram(&h, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Bucket"));
+    }
+
+    #[test]
+    fn report_hdrplot_format() {
+        let m = make_metrics(&[(200, 100)]);
+        let mut buf = Vec::new();
+        report_hdrplot(&m, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Value(ms)"));
+        assert!(text.contains("Percentile"));
+        assert!(text.contains("TotalCount"));
+        assert!(text.contains("1/(1-Percentile)"));
+    }
+
+    #[test]
+    fn go_duration_string_values() {
+        assert_eq!(go_duration_string(Duration::ZERO), "0s");
+        assert_eq!(go_duration_string(Duration::from_secs(1)), "1s");
+        assert_eq!(go_duration_string(Duration::from_millis(1)), "1ms");
+        assert_eq!(go_duration_string(Duration::from_micros(1)), "1µs");
+        assert_eq!(go_duration_string(Duration::from_nanos(1)), "1ns");
+        assert_eq!(go_duration_string(Duration::from_secs(3661)), "1h1m1s");
+        assert_eq!(go_duration_string(Duration::from_millis(1500)), "1.5s");
+    }
+
+    #[test]
+    fn histogram_from_bucket_str_valid() {
+        let h = Histogram::from_bucket_str("[0,1ms,10ms,100ms]").unwrap();
+        assert_eq!(h.buckets.len(), 4);
+        assert_eq!(h.buckets[0], Duration::ZERO);
+        assert_eq!(h.buckets[1], Duration::from_millis(1));
+    }
+
+    #[test]
+    fn histogram_from_bucket_str_invalid() {
+        assert!(Histogram::from_bucket_str("not-brackets").is_err());
+        assert!(Histogram::from_bucket_str("[]").is_err());
+    }
+}

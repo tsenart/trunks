@@ -239,3 +239,110 @@ async fn decode_http<R: AsyncBufReadExt + Unpin>(
         body,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn http_format_method_and_url() {
+        let input = b"GET http://example.com/api\n\n" as &[u8];
+        let reader = BufReader::new(input);
+        let mut tr = TargetReader::new("http", reader, TargetDefaults::default()).unwrap();
+        let target = tr.decode().await.unwrap();
+        assert_eq!(target.method, Method::GET);
+        assert_eq!(target.url.host().unwrap(), "example.com");
+        assert_eq!(target.url.path(), "/api");
+    }
+
+    #[tokio::test]
+    async fn http_format_with_headers() {
+        let input = b"POST http://example.com/\nContent-Type: application/json\nX-Custom: value\n\n"
+            as &[u8];
+        let reader = BufReader::new(input);
+        let mut tr = TargetReader::new("http", reader, TargetDefaults::default()).unwrap();
+        let target = tr.decode().await.unwrap();
+        assert_eq!(target.method, Method::POST);
+        assert!(target.headers.contains_key("content-type"));
+        assert!(target.headers.contains_key("x-custom"));
+    }
+
+    #[tokio::test]
+    async fn json_format_parsing() {
+        let input = br#"{"method":"PUT","url":"http://example.com/resource","headers":{"Authorization":["Bearer token"]},"body":""}"#;
+        let mut full = input.to_vec();
+        full.push(b'\n');
+        let reader = BufReader::new(full.as_slice());
+        let mut tr = TargetReader::new("json", reader, TargetDefaults::default()).unwrap();
+        let target = tr.decode().await.unwrap();
+        assert_eq!(target.method, Method::PUT);
+        assert!(target.url.to_string().contains("resource"));
+        assert!(target.headers.contains_key("authorization"));
+    }
+
+    #[tokio::test]
+    async fn static_targets_round_robin() {
+        let t1 = Arc::new(Target {
+            method: Method::GET,
+            url: Uri::from_static("http://a/"),
+            ..Default::default()
+        });
+        let t2 = Arc::new(Target {
+            method: Method::GET,
+            url: Uri::from_static("http://b/"),
+            ..Default::default()
+        });
+        let t3 = Arc::new(Target {
+            method: Method::GET,
+            url: Uri::from_static("http://c/"),
+            ..Default::default()
+        });
+        let mut targets: Targets<&[u8]> = Targets::from(vec![t1, t2, t3]);
+
+        let mut urls = Vec::new();
+        for _ in 0..6 {
+            let t = targets.decode().await.unwrap();
+            urls.push(t.url.to_string());
+        }
+        assert_eq!(
+            urls,
+            vec![
+                "http://a/",
+                "http://b/",
+                "http://c/",
+                "http://a/",
+                "http://b/",
+                "http://c/"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_targets_error() {
+        let mut targets: Targets<&[u8]> = Targets::None;
+        assert!(targets.decode().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_static_targets_error() {
+        let mut targets: Targets<&[u8]> = Targets::from(vec![]);
+        assert!(targets.decode().await.is_err());
+    }
+
+    #[test]
+    fn invalid_format_error() {
+        let input = b"" as &[u8];
+        let reader = BufReader::new(input);
+        assert!(TargetReader::new("xml", reader, TargetDefaults::default()).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_format_skips_comments() {
+        let input = b"# comment line\nGET http://example.com/\n\n" as &[u8];
+        let reader = BufReader::new(input);
+        let mut tr = TargetReader::new("http", reader, TargetDefaults::default()).unwrap();
+        let target = tr.decode().await.unwrap();
+        assert_eq!(target.method, Method::GET);
+    }
+}

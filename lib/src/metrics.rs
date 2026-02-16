@@ -213,3 +213,122 @@ impl Metrics {
         self.success = self.success_count as f64 / self.requests as f64;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_hit(
+        code: u16,
+        latency_ms: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+        error: &str,
+        ts_secs: u64,
+    ) -> Hit {
+        Hit {
+            attack: "test".to_string(),
+            seq: 0,
+            code,
+            timestamp: std::time::UNIX_EPOCH + Duration::from_secs(ts_secs),
+            latency: Duration::from_millis(latency_ms),
+            bytes_out,
+            bytes_in,
+            error: error.to_string(),
+            body: vec![],
+            method: "GET".to_string(),
+            url: "http://localhost/".to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn empty_metrics() {
+        let mut m = Metrics::new();
+        m.close();
+        assert_eq!(m.requests, 0);
+        assert_eq!(m.rate, 0.0);
+        assert_eq!(m.throughput, 0.0);
+        assert_eq!(m.success, 0.0);
+    }
+
+    #[test]
+    fn single_hit() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 100, 1024, 64, "", 1000));
+        m.close();
+        assert_eq!(m.requests, 1);
+        assert!((m.success - 1.0).abs() < 1e-9);
+        assert_eq!(m.bytes_in.total, 1024);
+        assert_eq!(m.bytes_out.total, 64);
+        assert_eq!(m.latencies.min, Duration::from_millis(100));
+        assert_eq!(m.latencies.max, Duration::from_millis(100));
+        assert_eq!(m.status_codes.get("200"), Some(&1));
+    }
+
+    #[test]
+    fn multiple_hits_accumulation() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 50, 100, 10, "", 1000));
+        m.add(&make_hit(200, 100, 200, 20, "", 1001));
+        m.add(&make_hit(200, 150, 300, 30, "", 1002));
+        m.close();
+        assert_eq!(m.requests, 3);
+        assert!((m.success - 1.0).abs() < 1e-9);
+        assert_eq!(m.latencies.min, Duration::from_millis(50));
+        assert_eq!(m.latencies.max, Duration::from_millis(150));
+        assert_eq!(m.bytes_in.total, 600);
+        assert_eq!(m.bytes_out.total, 60);
+    }
+
+    #[test]
+    fn status_code_bucketing() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 10, 0, 0, "", 1000));
+        m.add(&make_hit(200, 10, 0, 0, "", 1001));
+        m.add(&make_hit(301, 10, 0, 0, "", 1002));
+        m.add(&make_hit(404, 10, 0, 0, "", 1003));
+        m.add(&make_hit(500, 10, 0, 0, "", 1004));
+        m.close();
+        assert_eq!(m.status_codes.get("200"), Some(&2));
+        assert_eq!(m.status_codes.get("301"), Some(&1));
+        assert_eq!(m.status_codes.get("404"), Some(&1));
+        assert_eq!(m.status_codes.get("500"), Some(&1));
+        // Success = [200,400): 200, 200, 301 = 3/5
+        assert!((m.success - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn error_deduplication() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(0, 10, 0, 0, "timeout", 1000));
+        m.add(&make_hit(0, 10, 0, 0, "timeout", 1001));
+        m.add(&make_hit(0, 10, 0, 0, "conn refused", 1002));
+        m.close();
+        assert_eq!(m.errors.len(), 2);
+        assert!(m.errors.contains(&"timeout".to_string()));
+        assert!(m.errors.contains(&"conn refused".to_string()));
+    }
+
+    #[test]
+    fn rate_and_throughput() {
+        let mut m = Metrics::new();
+        for i in 0..10 {
+            m.add(&make_hit(200, 10, 0, 0, "", 1000 + i));
+        }
+        m.close();
+        // duration = 9s, rate = 10/9 ≈ 1.111
+        assert!((m.rate - 10.0 / 9.0).abs() < 0.01);
+        assert!((m.success - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn byte_means() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 10, 100, 0, "", 1000));
+        m.add(&make_hit(200, 10, 200, 0, "", 1001));
+        m.close();
+        assert!((m.bytes_in.mean - 150.0).abs() < 1e-9);
+    }
+}

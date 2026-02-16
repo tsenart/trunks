@@ -250,3 +250,219 @@ impl fmt::Display for SinePacer {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_pacer_pace_immediate() {
+        let p = ConstantPacer {
+            freq: 100,
+            per: Duration::from_secs(1),
+        };
+        let (wait, stop) = p.pace(Duration::ZERO, 0);
+        assert_eq!(wait, Duration::from_millis(10));
+        assert!(!stop);
+    }
+
+    #[test]
+    fn constant_pacer_pace_behind() {
+        let p = ConstantPacer {
+            freq: 10,
+            per: Duration::from_secs(1),
+        };
+        let (wait, stop) = p.pace(Duration::from_secs(1), 5);
+        assert_eq!(wait, Duration::ZERO);
+        assert!(!stop);
+    }
+
+    #[test]
+    fn constant_pacer_pace_ahead() {
+        let p = ConstantPacer {
+            freq: 10,
+            per: Duration::from_secs(1),
+        };
+        // At elapsed=0, hits=0: interval=100ms, delta=(0+1)*100ms=100ms > 0 → wait 100ms
+        let (wait, stop) = p.pace(Duration::ZERO, 0);
+        assert_eq!(wait, Duration::from_millis(100));
+        assert!(!stop);
+    }
+
+    #[test]
+    fn constant_pacer_zero_freq() {
+        let p = ConstantPacer {
+            freq: 0,
+            per: Duration::from_secs(1),
+        };
+        let (wait, stop) = p.pace(Duration::from_secs(1), 0);
+        assert_eq!(wait, Duration::ZERO);
+        assert!(!stop);
+    }
+
+    #[test]
+    fn constant_pacer_zero_per() {
+        let p = ConstantPacer {
+            freq: 100,
+            per: Duration::ZERO,
+        };
+        let (wait, stop) = p.pace(Duration::from_secs(1), 0);
+        assert_eq!(wait, Duration::ZERO);
+        assert!(!stop);
+    }
+
+    #[test]
+    fn constant_pacer_rate() {
+        let p = ConstantPacer {
+            freq: 100,
+            per: Duration::from_secs(1),
+        };
+        let r = p.rate(Duration::from_secs(5));
+        assert!((r - 100.0).abs() < 1e-3, "expected 100.0, got {}", r);
+    }
+
+    #[test]
+    fn linear_pacer_hits_at_zero() {
+        let p = LinearPacer {
+            start_at: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            slope: 10.0,
+        };
+        assert!((p.hits(Duration::ZERO) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn linear_pacer_rate_at_zero() {
+        let p = LinearPacer {
+            start_at: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            slope: 10.0,
+        };
+        let r = p.rate(Duration::ZERO);
+        assert!((r - 100.0).abs() < 1e-3, "expected 100.0, got {}", r);
+    }
+
+    #[test]
+    fn linear_pacer_rate_grows() {
+        let p = LinearPacer {
+            start_at: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            slope: 10.0,
+        };
+        let r = p.rate(Duration::from_secs(5));
+        assert!((r - 150.0).abs() < 1e-3, "expected 150.0, got {}", r);
+    }
+
+    #[test]
+    fn linear_pacer_pace_behind() {
+        let p = LinearPacer {
+            start_at: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            slope: 10.0,
+        };
+        // At elapsed=1s, expected hits ≈ 105, but only 10 sent → behind
+        let (wait, stop) = p.pace(Duration::from_secs(1), 10);
+        assert_eq!(wait, Duration::ZERO);
+        assert!(!stop);
+    }
+
+    #[test]
+    fn sine_pacer_invalid_zero_period() {
+        let p = SinePacer {
+            period: Duration::ZERO,
+            mean: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            amp: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            start_at: MEAN_UP,
+        };
+        let (_, stop) = p.pace(Duration::from_secs(1), 0);
+        assert!(stop);
+    }
+
+    #[test]
+    fn sine_pacer_invalid_amp_ge_mean() {
+        let p = SinePacer {
+            period: Duration::from_secs(10),
+            mean: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            amp: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            start_at: MEAN_UP,
+        };
+        let (_, stop) = p.pace(Duration::from_secs(1), 0);
+        assert!(stop);
+    }
+
+    #[test]
+    fn sine_pacer_rate_at_mean_up() {
+        let p = SinePacer {
+            period: Duration::from_secs(10),
+            mean: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            amp: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            start_at: MEAN_UP,
+        };
+        // At elapsed=0 with start_at=MEAN_UP (0.0), sin(0)=0, rate = mean = 100
+        let r = p.rate(Duration::ZERO);
+        assert!((r - 100.0).abs() < 1e-3, "expected 100.0, got {}", r);
+    }
+
+    #[test]
+    fn sine_pacer_rate_at_peak() {
+        let p = SinePacer {
+            period: Duration::from_secs(10),
+            mean: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            amp: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            start_at: PEAK,
+        };
+        // At elapsed=0 with start_at=PEAK (π/2), sin(π/2)=1, rate = 100+50 = 150
+        let r = p.rate(Duration::ZERO);
+        assert!((r - 150.0).abs() < 1e-3, "expected 150.0, got {}", r);
+    }
+
+    #[test]
+    fn sine_pacer_pace_valid_does_not_stop() {
+        let p = SinePacer {
+            period: Duration::from_secs(10),
+            mean: ConstantPacer {
+                freq: 100,
+                per: Duration::from_secs(1),
+            },
+            amp: ConstantPacer {
+                freq: 50,
+                per: Duration::from_secs(1),
+            },
+            start_at: MEAN_UP,
+        };
+        let (_, stop) = p.pace(Duration::from_secs(1), 50);
+        assert!(!stop);
+    }
+}

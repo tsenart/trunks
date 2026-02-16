@@ -266,6 +266,187 @@ mod tests {
 
         assert_eq!(hit, decoded);
     }
+
+    #[tokio::test]
+    async fn json_round_trip() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Request-Id".to_string(), vec!["abc-123".to_string()]);
+        let hit = Hit {
+            attack: "json-test".to_string(),
+            seq: 7,
+            code: 201,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(50),
+            bytes_out: 128,
+            bytes_in: 256,
+            error: String::new(),
+            body: vec![10, 20, 30],
+            method: "PUT".to_string(),
+            url: "http://localhost:8080/json".to_string(),
+            headers,
+        };
+
+        let mut buf = Vec::new();
+        JsonCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = JsonCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert_eq!(hit, decoded);
+    }
+
+    #[tokio::test]
+    async fn csv_round_trip() {
+        let hit = Hit {
+            attack: "csv-test".to_string(),
+            seq: 3,
+            code: 200,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(75),
+            bytes_out: 32,
+            bytes_in: 1024,
+            error: String::new(),
+            body: vec![5, 6, 7],
+            method: "GET".to_string(),
+            url: "http://localhost:8080/csv".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let mut buf = Vec::new();
+        CsvCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = CsvCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert_eq!(hit, decoded);
+    }
+
+    #[tokio::test]
+    async fn csv_round_trip_with_headers() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            vec!["application/json".to_string()],
+        );
+        let hit = Hit {
+            attack: "csv-hdr".to_string(),
+            seq: 1,
+            code: 200,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(10),
+            bytes_out: 0,
+            bytes_in: 0,
+            error: String::new(),
+            body: vec![],
+            method: "GET".to_string(),
+            url: "http://localhost/".to_string(),
+            headers: headers.clone(),
+        };
+
+        let mut buf = Vec::new();
+        CsvCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = CsvCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert_eq!(decoded.headers, headers);
+    }
+
+    #[tokio::test]
+    async fn codec_with_error_field() {
+        let hit = Hit {
+            attack: "err".to_string(),
+            seq: 0,
+            code: 0,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(100),
+            bytes_out: 0,
+            bytes_in: 0,
+            error: "connection refused".to_string(),
+            body: vec![],
+            method: "GET".to_string(),
+            url: "http://unreachable/".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let mut buf = Vec::new();
+        JsonCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = JsonCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert_eq!(decoded.error, "connection refused");
+    }
+
+    #[tokio::test]
+    async fn codec_with_empty_body() {
+        let hit = Hit {
+            attack: "empty-body".to_string(),
+            seq: 0,
+            code: 204,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(1),
+            bytes_out: 0,
+            bytes_in: 0,
+            error: String::new(),
+            body: vec![],
+            method: "DELETE".to_string(),
+            url: "http://localhost/resource".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let mut buf = Vec::new();
+        CsvCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = CsvCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert!(decoded.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_codec_with_special_chars() {
+        let hit = Hit {
+            attack: "special".to_string(),
+            seq: 0,
+            code: 0,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(500),
+            bytes_out: 0,
+            bytes_in: 0,
+            error: "timeout: \"dial tcp\"".to_string(),
+            body: vec![],
+            method: "GET".to_string(),
+            url: "http://localhost/".to_string(),
+            headers: HashMap::new(),
+        };
+
+        let mut buf = Vec::new();
+        JsonCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = JsonCodec.decode(&mut reader).await.expect("decode failed");
+
+        assert_eq!(decoded.error, "timeout: \"dial tcp\"");
+    }
 }
 
 fn headers_to_mime_base64(headers: &HashMap<String, Vec<String>>) -> String {
