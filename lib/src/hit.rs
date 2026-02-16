@@ -302,7 +302,9 @@ fn mime_base64_to_headers(encoded: &str) -> HashMap<String, Vec<String>> {
             continue;
         }
         if let Some((key, value)) = line.split_once(": ") {
-            map.entry(key.to_string()).or_default().push(value.to_string());
+            map.entry(key.to_string())
+                .or_default()
+                .push(value.to_string());
         }
     }
     map

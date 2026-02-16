@@ -128,7 +128,7 @@ fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
     buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
     buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
     buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-    // Question: encode domain name as labels
+                                          // Question: encode domain name as labels
     for label in name.split('.') {
         buf.push(label.len() as u8);
         buf.extend_from_slice(label.as_bytes());
@@ -142,7 +142,10 @@ fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
 /// Parse a DNS response and extract IP addresses from answer records.
 fn parse_dns_response(resp: &[u8]) -> io::Result<Vec<IpAddr>> {
     if resp.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS response too short"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response too short",
+        ));
     }
     let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
     // Skip header (12 bytes), then skip question section
@@ -152,7 +155,10 @@ fn parse_dns_response(resp: &[u8]) -> io::Result<Vec<IpAddr>> {
     // Skip QTYPE (2) + QCLASS (2)
     pos += 4;
     if pos > resp.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS response truncated in question"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response truncated in question",
+        ));
     }
 
     let mut addrs = Vec::new();
@@ -196,7 +202,10 @@ fn parse_dns_response(resp: &[u8]) -> io::Result<Vec<IpAddr>> {
 fn skip_dns_name(resp: &[u8], mut pos: usize) -> io::Result<usize> {
     loop {
         if pos >= resp.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS name out of bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS name out of bounds",
+            ));
         }
         let len = resp[pos] as usize;
         if len == 0 {
@@ -298,14 +307,10 @@ impl Service<Name> for TrunksResolver {
                 let idx = resolver_idx.fetch_add(1, Ordering::Relaxed) % resolvers.len();
                 let server = resolvers[idx];
                 let host_clone = host.clone();
-                let ips = tokio::task::spawn_blocking(move || {
-                    dns_resolve(&host_clone, server)
-                })
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-                ips.into_iter()
-                    .map(|ip| SocketAddr::new(ip, 0))
-                    .collect()
+                let ips = tokio::task::spawn_blocking(move || dns_resolve(&host_clone, server))
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+                ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()
             } else {
                 let host_clone = host.clone();
                 tokio::task::spawn_blocking(move || {

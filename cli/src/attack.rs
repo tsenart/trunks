@@ -5,7 +5,7 @@ use futures::StreamExt as _;
 use hyper::client::HttpConnector;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Response, Server};
-use num_cpus;
+
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
@@ -141,6 +141,7 @@ pub struct Opts {
     max_connections: usize,
 
     /// Connect via Unix domain socket
+    #[cfg(unix)]
     #[clap(long)]
     unix_socket: Option<String>,
 
@@ -197,16 +198,9 @@ struct PerLabelMetrics {
     fail_counts: HashMap<String, u64>,
 }
 
+#[derive(Default)]
 struct PrometheusMetrics {
     per_label: HashMap<LabelKey, PerLabelMetrics>,
-}
-
-impl Default for PrometheusMetrics {
-    fn default() -> Self {
-        Self {
-            per_label: HashMap::new(),
-        }
-    }
 }
 
 impl PrometheusMetrics {
@@ -216,14 +210,17 @@ impl PrometheusMetrics {
             url: hit.url.clone(),
             status: hit.code.to_string(),
         };
-        let m = self.per_label.entry(key).or_insert_with(|| PerLabelMetrics {
-            latency_sum_ns: 0,
-            latency_count: 0,
-            latency_buckets: vec![0; HISTOGRAM_BUCKETS.len()],
-            bytes_in: 0,
-            bytes_out: 0,
-            fail_counts: HashMap::new(),
-        });
+        let m = self
+            .per_label
+            .entry(key)
+            .or_insert_with(|| PerLabelMetrics {
+                latency_sum_ns: 0,
+                latency_count: 0,
+                latency_buckets: vec![0; HISTOGRAM_BUCKETS.len()],
+                bytes_in: 0,
+                bytes_out: 0,
+                fail_counts: HashMap::new(),
+            });
         let latency_ns = hit.latency.as_nanos() as u64;
         m.latency_sum_ns += latency_ns;
         m.latency_count += 1;
@@ -243,9 +240,7 @@ impl PrometheusMetrics {
     fn render(&self) -> String {
         let mut s = String::new();
         let mut keys: Vec<_> = self.per_label.keys().collect();
-        keys.sort_by(|a, b| {
-            (&a.method, &a.url, &a.status).cmp(&(&b.method, &b.url, &b.status))
-        });
+        keys.sort_by(|a, b| (&a.method, &a.url, &a.status).cmp(&(&b.method, &b.url, &b.status)));
 
         s.push_str("# HELP request_seconds Request latency\n");
         s.push_str("# TYPE request_seconds histogram\n");
@@ -278,7 +273,9 @@ impl PrometheusMetrics {
             ));
         }
 
-        s.push_str("\n# HELP request_bytes_in Bytes received from servers as response to requests\n");
+        s.push_str(
+            "\n# HELP request_bytes_in Bytes received from servers as response to requests\n",
+        );
         s.push_str("# TYPE request_bytes_in counter\n");
         for key in &keys {
             let m = &self.per_label[*key];
@@ -317,10 +314,7 @@ impl PrometheusMetrics {
                     key.status,
                     msg.replace('"', "\\\"")
                 );
-                s.push_str(&format!(
-                    "request_fail_count{{{}}} {}\n",
-                    labels, count
-                ));
+                s.push_str(&format!("request_fail_count{{{}}} {}\n", labels, count));
             }
         }
 
@@ -372,12 +366,11 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             slope: opts.slope,
         }),
         "sine" => {
-            let period: Duration = opts
+            let period: Duration = (*opts
                 .sine_period
                 .as_ref()
-                .ok_or_else(|| eyre::eyre!("--sine-period is required for sine pacer"))?
-                .clone()
-                .into();
+                .ok_or_else(|| eyre::eyre!("--sine-period is required for sine pacer"))?)
+            .into();
             let amp = match &opts.sine_amp {
                 Some(s) => parse_rate(s)?,
                 None => eyre::bail!("--sine-amp is required for sine pacer"),
@@ -459,7 +452,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             ))
         })
         .collect();
-    let dns_ttl = opts.dns_ttl.as_ref().map(|d| -> Duration { d.clone().into() });
+    let dns_ttl = opts.dns_ttl.as_ref().map(|d| -> Duration { (*d).into() });
     let resolver = trunks::TrunksResolver::new(connect_to_map, dns_ttl, opts.resolvers.clone());
 
     // Parse --proxy-header flags into HashMap<String, String>
@@ -510,6 +503,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
     let targets = Arc::new(Mutex::new(targets));
     let pacer = Arc::new(pacer);
 
+    #[cfg(unix)]
     if let Some(ref socket_path) = opts.unix_socket {
         // Unix domain socket: bypass DNS/TCP, connect directly to socket
         let connector = trunks::UnixConnector::new(socket_path);
@@ -530,10 +524,14 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             stop: stop.clone(),
         };
 
-        run_attack(atk, stop, &opts, &mut output).await
-    } else if opts.h2c {
+        return run_attack(atk, stop, opts, &mut output).await;
+    }
+
+    if opts.h2c {
         // h2c: HTTP/2 cleartext — no TLS wrapper, force HTTP/2
-        let client = client_builder.http2_only(true).build::<_, hyper::Body>(http);
+        let client = client_builder
+            .http2_only(true)
+            .build::<_, hyper::Body>(http);
 
         let atk = Attack {
             client,
@@ -550,7 +548,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             stop: stop.clone(),
         };
 
-        run_attack(atk, stop, &opts, &mut output).await
+        run_attack(atk, stop, opts, &mut output).await
     } else {
         // Build TLS config
         let client_auth = match (&opts.cert, &opts.key) {
@@ -659,7 +657,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             stop: stop.clone(),
         };
 
-        run_attack(atk, stop, &opts, &mut output).await
+        run_attack(atk, stop, opts, &mut output).await
     }
 }
 

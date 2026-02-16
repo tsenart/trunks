@@ -33,7 +33,12 @@ pub struct Attack<C, P: Pacer, R: AsyncBufRead + Send> {
     pub stop: CancellationToken,
 }
 
-impl<C: Connect + Clone + Send + Sync + 'static, P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<C, P, R> {
+impl<
+        C: Connect + Clone + Send + Sync + 'static,
+        P: Pacer + 'static,
+        R: AsyncBufRead + Send + Sync + 'static,
+    > Attack<C, P, R>
+{
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
         // Bounded(1) channel acts like Go's unbuffered channel: sends block
         // until a worker is ready to receive, enabling backpressure and
@@ -76,6 +81,7 @@ impl<C: Connect + Clone + Send + Sync + 'static, P: Pacer + 'static, R: AsyncBuf
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker<C: Connect + Clone + Send + Sync + 'static>(
     target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
@@ -102,7 +108,12 @@ async fn worker<C: Connect + Clone + Send + Sync + 'static>(
     }
 }
 
-async fn attack<C: Connect + Clone + Send + Sync + 'static, P: Pacer, R: AsyncBufRead + Send + Sync>(
+#[allow(clippy::too_many_arguments)]
+async fn attack<
+    C: Connect + Clone + Send + Sync + 'static,
+    P: Pacer,
+    R: AsyncBufRead + Send + Sync,
+>(
     duration: Duration,
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
@@ -255,6 +266,7 @@ fn authority_of(uri: &Uri) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn hit<C: Connect + Clone + Send + Sync + 'static>(
     attack: String,
     client: hyper::Client<C>,
@@ -290,10 +302,7 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
                 }
             }
             if let Ok(val) = hyper::header::HeaderValue::from_str(&seq.to_string()) {
-                headers.insert(
-                    hyper::header::HeaderName::from_static("x-trunks-seq"),
-                    val,
-                );
+                headers.insert(hyper::header::HeaderName::from_static("x-trunks-seq"), val);
             }
         }
         let body = if chunked && !current_body.is_empty() {
@@ -354,15 +363,15 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
         last_code = status.as_u16();
 
         if !is_redirect(status) || redirects < 0 {
-            let response_headers: HashMap<String, Vec<String>> = res.headers().iter().fold(
-                HashMap::new(),
-                |mut map, (name, value)| {
-                    map.entry(name.as_str().to_string())
-                        .or_default()
-                        .push(value.to_str().unwrap_or("").to_string());
-                    map
-                },
-            );
+            let response_headers: HashMap<String, Vec<String>> =
+                res.headers()
+                    .iter()
+                    .fold(HashMap::new(), |mut map, (name, value)| {
+                        map.entry(name.as_str().to_string())
+                            .or_default()
+                            .push(value.to_str().unwrap_or("").to_string());
+                        map
+                    });
             let mut body = to_bytes(res.into_body()).await?.to_vec();
             if max_body >= 0 {
                 body.truncate(max_body as usize);

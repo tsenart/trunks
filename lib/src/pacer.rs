@@ -56,7 +56,7 @@ impl Pacer for ConstantPacer {
         }
 
         let interval = self.per.as_nanos() as u64 / self.freq;
-        if std::u64::MAX / interval < hits {
+        if u64::MAX / interval < hits {
             // We would overflow delta if we continued, so stop the attack.
             return (Duration::ZERO, true);
         }

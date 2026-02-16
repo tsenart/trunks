@@ -106,16 +106,11 @@ pub async fn report(opts: &Opts) -> Result<()> {
                 "msgpack"
             };
 
-            loop {
-                match decode_hit(&mut input, input_format).await {
-                    Ok(hit) => {
-                        if let Some(ref mut h) = histogram {
-                            h.add(&hit);
-                        }
-                        metrics.add(&hit);
-                    }
-                    Err(_) => break,
+            while let Ok(hit) = decode_hit(&mut input, input_format).await {
+                if let Some(ref mut h) = histogram {
+                    h.add(&hit);
                 }
+                metrics.add(&hit);
             }
         }
         write_report(opts, &mut metrics, &mut histogram, &mut output).await

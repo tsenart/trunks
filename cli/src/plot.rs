@@ -183,9 +183,9 @@ fn lttb(data: &[(f64, f64)], threshold: usize) -> Vec<(f64, f64)> {
         let mut avg_y = 0.0f64;
         let next_len = next_end - next_start;
         if next_len > 0 {
-            for j in next_start..next_end {
-                avg_x += data[j].0;
-                avg_y += data[j].1;
+            for item in data.iter().take(next_end).skip(next_start) {
+                avg_x += item.0;
+                avg_y += item.1;
             }
             avg_x /= next_len as f64;
             avg_y /= next_len as f64;
@@ -195,8 +195,8 @@ fn lttb(data: &[(f64, f64)], threshold: usize) -> Vec<(f64, f64)> {
         let mut max_area = -1.0f64;
         let mut max_idx = bucket_start;
 
-        for j in bucket_start..bucket_end {
-            let area = ((data[j].0 - ax) * (avg_y - ay) - (avg_x - ax) * (data[j].1 - ay)).abs();
+        for (j, item) in data.iter().enumerate().take(bucket_end).skip(bucket_start) {
+            let area = ((item.0 - ax) * (avg_y - ay) - (avg_x - ax) * (item.1 - ay)).abs();
             if area > max_area {
                 max_area = area;
                 max_idx = j;

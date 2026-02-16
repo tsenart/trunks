@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "trunks",
-    about = "Son of Vegeta — a powerful HTTP load testing tool written in Rust"
+    about = "Son of Vegeta — a powerful HTTP load testing tool written in Rust",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -16,6 +17,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Execute an HTTP load test
     Attack(attack::Opts),

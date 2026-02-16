@@ -164,10 +164,12 @@ fn proxy_addr(proxy_uri: &Uri) -> io::Result<String> {
     let host = proxy_uri
         .host()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy URI has no host"))?;
-    let port = proxy_uri.port_u16().unwrap_or(match proxy_uri.scheme_str() {
-        Some("https") => 443,
-        _ => 80,
-    });
+    let port = proxy_uri
+        .port_u16()
+        .unwrap_or(match proxy_uri.scheme_str() {
+            Some("https") => 443,
+            _ => 80,
+        });
     Ok(format!("{}:{}", host, port))
 }
 
