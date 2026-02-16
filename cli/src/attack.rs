@@ -140,7 +140,7 @@ pub struct Opts {
     #[clap(long, default_value_t = 0)]
     max_connections: usize,
 
-    /// Connect via Unix domain socket (not yet implemented)
+    /// Connect via Unix domain socket
     #[clap(long)]
     unix_socket: Option<String>,
 
@@ -443,10 +443,6 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         Targets::from(targets)
     };
 
-    // Validate not-yet-implemented flags
-    if opts.unix_socket.is_some() {
-        eyre::bail!("--unix-socket requires hyperlocal crate (not yet implemented)");
-    }
     // Parse --connect-to mappings
     let connect_to_map: HashMap<String, Vec<String>> = opts
         .connect_to
@@ -488,7 +484,28 @@ pub async fn attack(opts: &Opts) -> Result<()> {
     let targets = Arc::new(Mutex::new(targets));
     let pacer = Arc::new(pacer);
 
-    if opts.h2c {
+    if let Some(ref socket_path) = opts.unix_socket {
+        // Unix domain socket: bypass DNS/TCP, connect directly to socket
+        let connector = trunks::UnixConnector::new(socket_path);
+        let client = client_builder.build::<_, hyper::Body>(connector);
+
+        let atk = Attack {
+            client,
+            duration: opts.duration.into(),
+            name: opts.name.clone(),
+            pacer,
+            targets,
+            workers: opts.workers,
+            max_workers: opts.max_workers,
+            timeout: opts.timeout.into(),
+            max_body: opts.max_body,
+            redirects: opts.redirects,
+            chunked: opts.chunked,
+            stop: stop.clone(),
+        };
+
+        run_attack(atk, stop, &opts, &mut output).await
+    } else if opts.h2c {
         // h2c: HTTP/2 cleartext — no TLS wrapper, force HTTP/2
         let client = client_builder.http2_only(true).build::<_, hyper::Body>(http);
 
