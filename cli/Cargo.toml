@@ -15,7 +15,7 @@ name = "trunks"
 path = "src/main.rs"
 
 [dependencies]
-trunks = { path = "../lib" }
+trunks = { path = "../lib", version = "0.1.0" }
 
 async-trait      = { workspace = true }
 clap             = { workspace = true, features = ["default", "derive", "env" ]}
