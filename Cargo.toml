@@ -33,6 +33,7 @@ num_cpus           = { version = "1.16", default-features = false }
 rustls-native-certs = { version = "0.6",  default-features = false }
 rmp-serde          = { version = "1.1",  default-features = false }
 rustls-pemfile     = { version = "1.0",  default-features = false }
+tower-service      = { version = "0.3",  default-features = false }
 
 
 [profile.release]

@@ -25,6 +25,7 @@ hyper            = { workspace = true, features = ["client", "http1", "http2", "
 hyper-rustls     = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
 serde_json       = { workspace = true }
 tokio            = { workspace = true, features = ["fs", "io-util", "io-std", "signal", "macros", "rt-multi-thread"]}
+tokio-util       = { workspace = true }
 num_cpus         = { workspace = true }
 rustls           = { version = "0.21", default-features = false, features = ["dangerous_configuration"] }
 rustls-native-certs = { workspace = true }

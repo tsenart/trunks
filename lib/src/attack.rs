@@ -1,14 +1,16 @@
 use futures::Stream;
 use hyper::body::to_bytes;
-use hyper::client::HttpConnector;
+use hyper::client::connect::Connect;
 use hyper::{Body, Client, Method, Request, Uri};
-use hyper_rustls::HttpsConnector;
+use std::collections::HashMap;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tokio::io::AsyncBufRead;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::hit::Hit;
@@ -16,9 +18,9 @@ use crate::pacer::Pacer;
 use crate::target::{Target, TargetRead, Targets};
 
 #[derive(Debug)]
-pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
+pub struct Attack<C, P: Pacer, R: AsyncBufRead + Send> {
     pub name: String,
-    pub client: Client<HttpsConnector<HttpConnector>>,
+    pub client: Client<C>,
     pub duration: Duration,
     pub pacer: Arc<P>,
     pub targets: Arc<Mutex<Targets<R>>>,
@@ -28,9 +30,10 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub max_body: i64,
     pub redirects: i32,
     pub chunked: bool,
+    pub stop: CancellationToken,
 }
 
-impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
+impl<C: Connect + Clone + Send + Sync + 'static, P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<C, P, R> {
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
         // Bounded(1) channel acts like Go's unbuffered channel: sends block
         // until a worker is ready to receive, enabling backpressure and
@@ -66,16 +69,17 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
             self.max_body,
             self.redirects,
             self.chunked,
+            self.stop.clone(),
         ));
 
         Box::pin(hit_recv)
     }
 }
 
-async fn worker(
+async fn worker<C: Connect + Clone + Send + Sync + 'static>(
     target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    client: hyper::Client<C>,
     name: String,
     timeout: Duration,
     max_body: i64,
@@ -98,7 +102,7 @@ async fn worker(
     }
 }
 
-async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
+async fn attack<C: Connect + Clone + Send + Sync + 'static, P: Pacer, R: AsyncBufRead + Send + Sync>(
     duration: Duration,
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
@@ -107,12 +111,13 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     max_workers: usize,
     target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    client: hyper::Client<C>,
     name: String,
     timeout: Duration,
     max_body: i64,
     redirects: i32,
     chunked: bool,
+    stop: CancellationToken,
 ) {
     let mut count: u64 = 0;
     let mut workers = workers;
@@ -124,6 +129,10 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     };
 
     loop {
+        if stop.is_cancelled() {
+            break;
+        }
+
         let elapsed = began.elapsed();
         if let Some(dl) = deadline {
             if tokio::time::Instant::now() >= dl {
@@ -131,8 +140,8 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
             }
         }
 
-        let (wait, stop) = pacer.pace(elapsed, count);
-        if stop {
+        let (wait, pacer_stop) = pacer.pace(elapsed, count);
+        if pacer_stop {
             break;
         }
 
@@ -141,7 +150,10 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
                 tokio::task::yield_now().await;
                 continue; // spin loop
             }
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(wait) => {}
+            }
         }
 
         count += 1;
@@ -174,14 +186,17 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
                     // Fall through to blocking send with the returned pair.
                     let target = pair.1;
                     if let Some(dl) = deadline {
-                        if tokio::time::timeout_at(dl, target_send.send((count, target)))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            res = tokio::time::timeout_at(dl, target_send.send((count, target))) => {
+                                if res.is_err() { break; }
+                            }
                         }
                     } else {
-                        let _ = target_send.send((count, target)).await;
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = target_send.send((count, target)) => {}
+                        }
                     }
                     tokio::task::yield_now().await;
                     continue;
@@ -192,14 +207,17 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
 
         // At max_workers: blocking send with deadline.
         if let Some(dl) = deadline {
-            if tokio::time::timeout_at(dl, target_send.send((count, target)))
-                .await
-                .is_err()
-            {
-                break;
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                res = tokio::time::timeout_at(dl, target_send.send((count, target))) => {
+                    if res.is_err() { break; }
+                }
             }
         } else {
-            let _ = target_send.send((count, target)).await;
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = target_send.send((count, target)) => {}
+            }
         }
 
         tokio::task::yield_now().await;
@@ -237,9 +255,9 @@ fn authority_of(uri: &Uri) -> String {
         .to_string()
 }
 
-async fn hit(
+async fn hit<C: Connect + Clone + Send + Sync + 'static>(
     attack: String,
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    client: hyper::Client<C>,
     seq: u64,
     target: Arc<Target>,
     timeout: Duration,
@@ -263,6 +281,20 @@ async fn hit(
         let mut req = Request::builder().method(&current_method).uri(&current_uri);
         if let Some(headers) = req.headers_mut() {
             *headers = current_headers.clone();
+            if !attack.is_empty() {
+                if let Ok(val) = hyper::header::HeaderValue::from_str(&attack) {
+                    headers.insert(
+                        hyper::header::HeaderName::from_static("x-trunks-attack"),
+                        val,
+                    );
+                }
+            }
+            if let Ok(val) = hyper::header::HeaderValue::from_str(&seq.to_string()) {
+                headers.insert(
+                    hyper::header::HeaderName::from_static("x-trunks-seq"),
+                    val,
+                );
+            }
         }
         let body = if chunked && !current_body.is_empty() {
             let bytes = current_body.clone();
@@ -292,6 +324,7 @@ async fn hit(
                         body: vec![],
                         method,
                         url,
+                        headers: HashMap::new(),
                     })
                 }
             }
@@ -312,6 +345,7 @@ async fn hit(
                     body: vec![],
                     method,
                     url,
+                    headers: HashMap::new(),
                 })
             }
         };
@@ -320,6 +354,15 @@ async fn hit(
         last_code = status.as_u16();
 
         if !is_redirect(status) || redirects < 0 {
+            let response_headers: HashMap<String, Vec<String>> = res.headers().iter().fold(
+                HashMap::new(),
+                |mut map, (name, value)| {
+                    map.entry(name.as_str().to_string())
+                        .or_default()
+                        .push(value.to_str().unwrap_or("").to_string());
+                    map
+                },
+            );
             let mut body = to_bytes(res.into_body()).await?.to_vec();
             if max_body >= 0 {
                 body.truncate(max_body as usize);
@@ -337,6 +380,7 @@ async fn hit(
                 body,
                 method,
                 url,
+                headers: response_headers,
             });
         }
 
@@ -393,6 +437,7 @@ async fn hit(
         body: vec![],
         method,
         url,
+        headers: HashMap::new(),
     })
 }
 

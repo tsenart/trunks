@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use trunks::{
     Attack, Codec, ConstantPacer, CsvCodec, Hit, JsonCodec, LinearPacer, MsgpackCodec, Pacer,
     SinePacer, TargetDefaults, TargetRead, TargetReader, Targets,
@@ -143,7 +144,7 @@ pub struct Opts {
     #[clap(long)]
     unix_socket: Option<String>,
 
-    /// Enable HTTP/2 cleartext (h2c) without TLS (not yet implemented)
+    /// Enable HTTP/2 cleartext (h2c) without TLS
     #[clap(long, default_value_t = false)]
     h2c: bool,
 
@@ -151,127 +152,172 @@ pub struct Opts {
     #[clap(long, default_value_t = false)]
     chunked: bool,
 
+    /// Custom proxy CONNECT headers (repeatable), format "Key: Value"
+    #[clap(long = "proxy-header")]
+    proxy_headers: Vec<String>,
+
+    /// Enable TLS session resumption (enabled by default)
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    session_tickets: bool,
+
     /// Prometheus metrics endpoint address (e.g. "0.0.0.0:8880")
     #[clap(long)]
     prometheus_addr: Option<String>,
+
+    /// Remap host connections (repeatable), format "from=to1,to2,..."
+    #[clap(long = "connect-to")]
+    connect_to: Vec<String>,
+
+    /// DNS cache TTL (0s = cache forever, omit = no cache)
+    #[clap(long = "dns-ttl")]
+    dns_ttl: Option<DurationString>,
 }
 
 const HISTOGRAM_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-struct PrometheusMetrics {
-    requests_total: u64,
-    requests_ok: u64,
-    requests_err: u64,
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct LabelKey {
+    method: String,
+    url: String,
+    status: String,
+}
+
+struct PerLabelMetrics {
     latency_sum_ns: u64,
     latency_count: u64,
     latency_buckets: Vec<u64>,
-    status_codes: HashMap<u16, u64>,
-    bytes_in_total: u64,
-    bytes_out_total: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    fail_counts: HashMap<String, u64>,
+}
+
+struct PrometheusMetrics {
+    per_label: HashMap<LabelKey, PerLabelMetrics>,
 }
 
 impl Default for PrometheusMetrics {
     fn default() -> Self {
         Self {
-            requests_total: 0,
-            requests_ok: 0,
-            requests_err: 0,
-            latency_sum_ns: 0,
-            latency_count: 0,
-            latency_buckets: vec![0; HISTOGRAM_BUCKETS.len()],
-            status_codes: HashMap::new(),
-            bytes_in_total: 0,
-            bytes_out_total: 0,
+            per_label: HashMap::new(),
         }
     }
 }
 
 impl PrometheusMetrics {
     fn update(&mut self, hit: &Hit) {
-        self.requests_total += 1;
-        if hit.error.is_empty() {
-            self.requests_ok += 1;
-        } else {
-            self.requests_err += 1;
-        }
+        let key = LabelKey {
+            method: hit.method.clone(),
+            url: hit.url.clone(),
+            status: hit.code.to_string(),
+        };
+        let m = self.per_label.entry(key).or_insert_with(|| PerLabelMetrics {
+            latency_sum_ns: 0,
+            latency_count: 0,
+            latency_buckets: vec![0; HISTOGRAM_BUCKETS.len()],
+            bytes_in: 0,
+            bytes_out: 0,
+            fail_counts: HashMap::new(),
+        });
         let latency_ns = hit.latency.as_nanos() as u64;
-        self.latency_sum_ns += latency_ns;
-        self.latency_count += 1;
+        m.latency_sum_ns += latency_ns;
+        m.latency_count += 1;
         let latency_s = latency_ns as f64 / 1_000_000_000.0;
         for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
             if latency_s <= bound {
-                self.latency_buckets[i] += 1;
+                m.latency_buckets[i] += 1;
             }
         }
-        *self.status_codes.entry(hit.code).or_insert(0) += 1;
-        self.bytes_in_total += hit.bytes_in;
-        self.bytes_out_total += hit.bytes_out;
+        m.bytes_in += hit.bytes_in;
+        m.bytes_out += hit.bytes_out;
+        if !hit.error.is_empty() {
+            *m.fail_counts.entry(hit.error.clone()).or_insert(0) += 1;
+        }
     }
 
     fn render(&self) -> String {
         let mut s = String::new();
-        s.push_str("# HELP trunks_requests_total Total number of requests\n");
-        s.push_str("# TYPE trunks_requests_total counter\n");
-        s.push_str(&format!(
-            "trunks_requests_total {}\n\n",
-            self.requests_total
-        ));
+        let mut keys: Vec<_> = self.per_label.keys().collect();
+        keys.sort_by(|a, b| {
+            (&a.method, &a.url, &a.status).cmp(&(&b.method, &b.url, &b.status))
+        });
 
-        s.push_str("# HELP trunks_requests_success_total Total successful requests\n");
-        s.push_str("# TYPE trunks_requests_success_total counter\n");
-        s.push_str(&format!(
-            "trunks_requests_success_total {}\n\n",
-            self.requests_ok
-        ));
-
-        s.push_str("# HELP trunks_request_duration_seconds Request duration histogram\n");
-        s.push_str("# TYPE trunks_request_duration_seconds histogram\n");
-        let mut cumulative: u64 = 0;
-        for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
-            cumulative += self.latency_buckets[i];
+        s.push_str("# HELP request_seconds Request latency\n");
+        s.push_str("# TYPE request_seconds histogram\n");
+        for key in &keys {
+            let m = &self.per_label[*key];
+            let labels = format!(
+                "method=\"{}\",url=\"{}\",status=\"{}\"",
+                key.method, key.url, key.status
+            );
+            let mut cumulative: u64 = 0;
+            for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
+                cumulative += m.latency_buckets[i];
+                s.push_str(&format!(
+                    "request_seconds_bucket{{{},le=\"{}\"}} {}\n",
+                    labels, bound, cumulative
+                ));
+            }
             s.push_str(&format!(
-                "trunks_request_duration_seconds_bucket{{le=\"{}\"}} {}\n",
-                bound, cumulative
+                "request_seconds_bucket{{{},le=\"+Inf\"}} {}\n",
+                labels, m.latency_count
+            ));
+            s.push_str(&format!(
+                "request_seconds_sum{{{}}} {:.6}\n",
+                labels,
+                m.latency_sum_ns as f64 / 1_000_000_000.0
+            ));
+            s.push_str(&format!(
+                "request_seconds_count{{{}}} {}\n",
+                labels, m.latency_count
             ));
         }
-        s.push_str(&format!(
-            "trunks_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\n",
-            self.latency_count
-        ));
-        s.push_str(&format!(
-            "trunks_request_duration_seconds_sum {:.6}\n",
-            self.latency_sum_ns as f64 / 1_000_000_000.0
-        ));
-        s.push_str(&format!(
-            "trunks_request_duration_seconds_count {}\n\n",
-            self.latency_count
-        ));
 
-        s.push_str("# HELP trunks_bytes_in_total Total bytes received\n");
-        s.push_str("# TYPE trunks_bytes_in_total counter\n");
-        s.push_str(&format!(
-            "trunks_bytes_in_total {}\n\n",
-            self.bytes_in_total
-        ));
+        s.push_str("\n# HELP request_bytes_in Bytes received from servers as response to requests\n");
+        s.push_str("# TYPE request_bytes_in counter\n");
+        for key in &keys {
+            let m = &self.per_label[*key];
+            let labels = format!(
+                "method=\"{}\",url=\"{}\",status=\"{}\"",
+                key.method, key.url, key.status
+            );
+            s.push_str(&format!("request_bytes_in{{{}}} {}\n", labels, m.bytes_in));
+        }
 
-        s.push_str("# HELP trunks_bytes_out_total Total bytes sent\n");
-        s.push_str("# TYPE trunks_bytes_out_total counter\n");
-        s.push_str(&format!(
-            "trunks_bytes_out_total {}\n\n",
-            self.bytes_out_total
-        ));
-
-        s.push_str("# HELP trunks_status_code_total Requests by status code\n");
-        s.push_str("# TYPE trunks_status_code_total counter\n");
-        let mut codes: Vec<_> = self.status_codes.iter().collect();
-        codes.sort_by_key(|(code, _)| *code);
-        for (code, count) in codes {
+        s.push_str("\n# HELP request_bytes_out Bytes sent to servers during requests\n");
+        s.push_str("# TYPE request_bytes_out counter\n");
+        for key in &keys {
+            let m = &self.per_label[*key];
+            let labels = format!(
+                "method=\"{}\",url=\"{}\",status=\"{}\"",
+                key.method, key.url, key.status
+            );
             s.push_str(&format!(
-                "trunks_status_code_total{{code=\"{}\"}} {}\n",
-                code, count
+                "request_bytes_out{{{}}} {}\n",
+                labels, m.bytes_out
             ));
+        }
+
+        s.push_str("\n# HELP request_fail_count Count of failed requests\n");
+        s.push_str("# TYPE request_fail_count counter\n");
+        for key in &keys {
+            let m = &self.per_label[*key];
+            let mut errs: Vec<_> = m.fail_counts.iter().collect();
+            errs.sort_by_key(|(msg, _)| (*msg).clone());
+            for (msg, count) in errs {
+                let labels = format!(
+                    "method=\"{}\",url=\"{}\",status=\"{}\",message=\"{}\"",
+                    key.method,
+                    key.url,
+                    key.status,
+                    msg.replace('"', "\\\"")
+                );
+                s.push_str(&format!(
+                    "request_fail_count{{{}}} {}\n",
+                    labels, count
+                ));
+            }
         }
 
         s
@@ -401,11 +447,23 @@ pub async fn attack(opts: &Opts) -> Result<()> {
     if opts.unix_socket.is_some() {
         eyre::bail!("--unix-socket requires hyperlocal crate (not yet implemented)");
     }
-    if opts.h2c {
-        eyre::bail!("--h2c (HTTP/2 cleartext) is not yet implemented");
-    }
-    // Build HTTP connector with local address binding
-    let mut http = HttpConnector::new();
+    // Parse --connect-to mappings
+    let connect_to_map: HashMap<String, Vec<String>> = opts
+        .connect_to
+        .iter()
+        .filter_map(|s| {
+            let (from, to) = s.split_once('=')?;
+            Some((
+                from.to_string(),
+                to.split(',').map(|s| s.trim().to_string()).collect(),
+            ))
+        })
+        .collect();
+    let dns_ttl = opts.dns_ttl.as_ref().map(|d| -> Duration { d.clone().into() });
+    let resolver = trunks::TrunksResolver::new(connect_to_map, dns_ttl);
+
+    // Build HTTP connector with custom resolver and local address binding
+    let mut http = HttpConnector::new_with_resolver(resolver);
     http.enforce_http(false);
     if let Some(ref addr) = opts.laddr {
         let ip: std::net::IpAddr = addr
@@ -414,89 +472,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         http.set_local_address(Some(ip));
     }
 
-    // Build TLS config
-    let client_auth = match (&opts.cert, &opts.key) {
-        (Some(cert_path), Some(key_path)) => {
-            let certs = load_certs(cert_path)?;
-            let key = load_key(key_path)?;
-            ClientAuth::Cert(certs, key)
-        }
-        (None, None) => ClientAuth::None,
-        _ => eyre::bail!("--cert and --key must both be provided for mTLS"),
-    };
-
-    let https = if opts.insecure {
-        let tls_config = match client_auth {
-            ClientAuth::Cert(certs, key) => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_single_cert(certs, key)
-                .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-            ClientAuth::None => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth(),
-        };
-
-        let builder = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http();
-
-        if opts.http2 {
-            builder.enable_http1().enable_http2().wrap_connector(http)
-        } else {
-            builder.enable_http1().wrap_connector(http)
-        }
-    } else {
-        let tls_config = if opts.root_certs.is_empty() {
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs()? {
-                root_store
-                    .add(&rustls::Certificate(cert.0))
-                    .map_err(|e| eyre::eyre!("invalid native root cert: {}", e))?;
-            }
-            let builder = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store);
-            match client_auth {
-                ClientAuth::Cert(certs, key) => builder
-                    .with_single_cert(certs, key)
-                    .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-                ClientAuth::None => builder.with_no_client_auth(),
-            }
-        } else {
-            let mut root_store = rustls::RootCertStore::empty();
-            for path in &opts.root_certs {
-                let certs = load_certs(path)?;
-                for cert in certs {
-                    root_store
-                        .add(&cert)
-                        .map_err(|e| eyre::eyre!("invalid root cert in {}: {}", path, e))?;
-                }
-            }
-            let builder = rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store);
-            match client_auth {
-                ClientAuth::Cert(certs, key) => builder
-                    .with_single_cert(certs, key)
-                    .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-                ClientAuth::None => builder.with_no_client_auth(),
-            }
-        };
-
-        let builder = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http();
-
-        if opts.http2 {
-            builder.enable_http1().enable_http2().wrap_connector(http)
-        } else {
-            builder.enable_http1().wrap_connector(http)
-        }
-    };
-
-    // Build HTTP client
+    // Build HTTP client pool settings
     let mut client_builder = Client::builder();
     let pool_size = if opts.max_connections > 0 {
         opts.max_connections
@@ -508,20 +484,153 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         client_builder.pool_idle_timeout(Duration::ZERO);
     }
 
-    let atk = Attack {
-        client: client_builder.build::<_, hyper::Body>(https),
-        duration: opts.duration.into(),
-        name: opts.name.clone(),
-        pacer: Arc::new(pacer),
-        targets: Arc::new(Mutex::new(targets)),
-        workers: opts.workers,
-        max_workers: opts.max_workers,
-        timeout: opts.timeout.into(),
-        max_body: opts.max_body,
-        redirects: opts.redirects,
-        chunked: opts.chunked,
-    };
+    let stop = CancellationToken::new();
+    let targets = Arc::new(Mutex::new(targets));
+    let pacer = Arc::new(pacer);
 
+    if opts.h2c {
+        // h2c: HTTP/2 cleartext — no TLS wrapper, force HTTP/2
+        let client = client_builder.http2_only(true).build::<_, hyper::Body>(http);
+
+        let atk = Attack {
+            client,
+            duration: opts.duration.into(),
+            name: opts.name.clone(),
+            pacer,
+            targets,
+            workers: opts.workers,
+            max_workers: opts.max_workers,
+            timeout: opts.timeout.into(),
+            max_body: opts.max_body,
+            redirects: opts.redirects,
+            chunked: opts.chunked,
+            stop: stop.clone(),
+        };
+
+        run_attack(atk, stop, &opts, &mut output).await
+    } else {
+        // Build TLS config
+        let client_auth = match (&opts.cert, &opts.key) {
+            (Some(cert_path), Some(key_path)) => {
+                let certs = load_certs(cert_path)?;
+                let key = load_key(key_path)?;
+                ClientAuth::Cert(certs, key)
+            }
+            (None, None) => ClientAuth::None,
+            _ => eyre::bail!("--cert and --key must both be provided for mTLS"),
+        };
+
+        let https = if opts.insecure {
+            let mut tls_config = match client_auth {
+                ClientAuth::Cert(certs, key) => rustls::ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_single_cert(certs, key)
+                    .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
+                ClientAuth::None => rustls::ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth(),
+            };
+
+            if !opts.session_tickets {
+                tls_config.resumption = rustls::client::Resumption::disabled();
+            }
+
+            let builder = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(tls_config)
+                .https_or_http();
+
+            if opts.http2 {
+                builder.enable_http1().enable_http2().wrap_connector(http)
+            } else {
+                builder.enable_http1().wrap_connector(http)
+            }
+        } else {
+            let mut tls_config = if opts.root_certs.is_empty() {
+                let mut root_store = rustls::RootCertStore::empty();
+                for cert in rustls_native_certs::load_native_certs()? {
+                    root_store
+                        .add(&rustls::Certificate(cert.0))
+                        .map_err(|e| eyre::eyre!("invalid native root cert: {}", e))?;
+                }
+                let builder = rustls::ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_root_certificates(root_store);
+                match client_auth {
+                    ClientAuth::Cert(certs, key) => builder
+                        .with_single_cert(certs, key)
+                        .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
+                    ClientAuth::None => builder.with_no_client_auth(),
+                }
+            } else {
+                let mut root_store = rustls::RootCertStore::empty();
+                for path in &opts.root_certs {
+                    let certs = load_certs(path)?;
+                    for cert in certs {
+                        root_store
+                            .add(&cert)
+                            .map_err(|e| eyre::eyre!("invalid root cert in {}: {}", path, e))?;
+                    }
+                }
+                let builder = rustls::ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_root_certificates(root_store);
+                match client_auth {
+                    ClientAuth::Cert(certs, key) => builder
+                        .with_single_cert(certs, key)
+                        .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
+                    ClientAuth::None => builder.with_no_client_auth(),
+                }
+            };
+
+            if !opts.session_tickets {
+                tls_config.resumption = rustls::client::Resumption::disabled();
+            }
+
+            let builder = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(tls_config)
+                .https_or_http();
+
+            if opts.http2 {
+                builder.enable_http1().enable_http2().wrap_connector(http)
+            } else {
+                builder.enable_http1().wrap_connector(http)
+            }
+        };
+
+        let client = client_builder.build::<_, hyper::Body>(https);
+
+        let atk = Attack {
+            client,
+            duration: opts.duration.into(),
+            name: opts.name.clone(),
+            pacer,
+            targets,
+            workers: opts.workers,
+            max_workers: opts.max_workers,
+            timeout: opts.timeout.into(),
+            max_body: opts.max_body,
+            redirects: opts.redirects,
+            chunked: opts.chunked,
+            stop: stop.clone(),
+        };
+
+        run_attack(atk, stop, &opts, &mut output).await
+    }
+}
+
+async fn run_attack<C, P, R>(
+    atk: Attack<C, P, R>,
+    stop: CancellationToken,
+    opts: &Opts,
+    output: &mut Output,
+) -> Result<()>
+where
+    C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
+    P: trunks::Pacer + 'static,
+    R: AsyncBufRead + Send + Sync + 'static,
+{
     let prom_metrics = Arc::new(Mutex::new(PrometheusMetrics::default()));
     if let Some(ref addr) = opts.prometheus_addr {
         start_prometheus_server(addr, prom_metrics.clone()).await?;
@@ -532,36 +641,42 @@ pub async fn attack(opts: &Opts) -> Result<()> {
 
     let encode_format = opts.encode.as_str();
 
-    tokio::select! {
-        _ = async {
-            while let Some(result) = hits.next().await {
-                match result {
-                    Ok(hit) => {
-                        if opts.prometheus_addr.is_some() {
-                            let mut pm = prom_metrics.lock().await;
-                            pm.update(&hit);
-                        }
-                        let res = match encode_format {
-                            "csv" => CsvCodec.encode(&mut output, &hit).await,
-                            "msgpack" => MsgpackCodec.encode(&mut output, &hit).await,
-                            "json" => JsonCodec.encode(&mut output, &hit).await,
-                            other => {
-                                eprintln!("Error: unknown encoding: {}", other);
-                                return;
-                            }
-                        };
-                        if let Err(err) = res {
-                            eprintln!("Error: {}", err);
-                        }
+    // Two-phase graceful stop (vegeta-style):
+    // First Ctrl+C: stop sending new requests, drain in-flight workers
+    // Second Ctrl+C: exit immediately
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("\nGraceful shutdown... (press Ctrl+C again to force exit)");
+        stop.cancel();
+
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("\nForced exit");
+        std::process::exit(0);
+    });
+
+    while let Some(result) = hits.next().await {
+        match result {
+            Ok(hit) => {
+                if opts.prometheus_addr.is_some() {
+                    let mut pm = prom_metrics.lock().await;
+                    pm.update(&hit);
+                }
+                let res = match encode_format {
+                    "csv" => CsvCodec.encode(output, &hit).await,
+                    "msgpack" => MsgpackCodec.encode(output, &hit).await,
+                    "json" => JsonCodec.encode(output, &hit).await,
+                    other => {
+                        eprintln!("Error: unknown encoding: {}", other);
+                        return Ok(());
                     }
-                    Err(err) => {
-                        eprintln!("Error: {}", err);
-                    }
+                };
+                if let Err(err) = res {
+                    eprintln!("Error: {}", err);
                 }
             }
-        } => {}
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nInterrupted");
+            Err(err) => {
+                eprintln!("Error: {}", err);
+            }
         }
     }
 

@@ -3,6 +3,7 @@ use base64_simd::STANDARD;
 use csv::ReaderBuilder;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -23,7 +24,7 @@ pub struct Hit {
     pub body: Vec<u8>,
     pub method: String,
     pub url: String,
-    // pub headers: HashMap<String, Vec<String>>, // Using HashMap instead of http.Header
+    pub headers: HashMap<String, Vec<String>>,
 }
 
 impl Hit {
@@ -68,6 +69,7 @@ impl Codec for CsvCodec {
             .unwrap_or_default()
             .as_nanos() as i128;
         let body_b64 = STANDARD.encode_to_string(&hit.body);
+        let headers_b64 = headers_to_mime_base64(&hit.headers);
 
         let mut buf = Vec::new();
         {
@@ -84,7 +86,7 @@ impl Codec for CsvCodec {
                 hit.seq.to_string(),
                 hit.method.clone(),
                 hit.url.clone(),
-                String::new(), // response headers placeholder
+                headers_b64,
             ])?;
             wtr.flush()?;
         }
@@ -129,6 +131,11 @@ impl Codec for CsvCodec {
         let seq: u64 = record[8].parse()?;
         let method = record[9].to_string();
         let url = record[10].to_string();
+        let headers = if record.len() > 11 {
+            mime_base64_to_headers(&record[11])
+        } else {
+            HashMap::new()
+        };
 
         Ok(Hit {
             attack,
@@ -142,6 +149,7 @@ impl Codec for CsvCodec {
             body,
             method,
             url,
+            headers,
         })
     }
 }
@@ -209,6 +217,7 @@ mod tests {
             body: vec![1, 2, 3, 4],
             method: "POST".to_string(),
             url: "http://localhost:8080/api".to_string(),
+            headers: HashMap::new(),
         };
 
         let mut buf = Vec::new();
@@ -240,6 +249,7 @@ mod tests {
             body: vec![],
             method: "GET".to_string(),
             url: "http://unreachable:9999/".to_string(),
+            headers: HashMap::new(),
         };
 
         let mut buf = Vec::new();
@@ -256,6 +266,46 @@ mod tests {
 
         assert_eq!(hit, decoded);
     }
+}
+
+fn headers_to_mime_base64(headers: &HashMap<String, Vec<String>>) -> String {
+    if headers.is_empty() {
+        return String::new();
+    }
+    let mut keys: Vec<&String> = headers.keys().collect();
+    keys.sort();
+    let mut mime = Vec::new();
+    for key in keys {
+        for value in &headers[key] {
+            mime.extend_from_slice(key.as_bytes());
+            mime.extend_from_slice(b": ");
+            mime.extend_from_slice(value.as_bytes());
+            mime.extend_from_slice(b"\r\n");
+        }
+    }
+    mime.extend_from_slice(b"\r\n");
+    STANDARD.encode_to_string(&mime)
+}
+
+fn mime_base64_to_headers(encoded: &str) -> HashMap<String, Vec<String>> {
+    if encoded.is_empty() {
+        return HashMap::new();
+    }
+    let bytes = match STANDARD.decode_to_vec(encoded) {
+        Ok(b) => b,
+        Err(_) => return HashMap::new(),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for line in text.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(": ") {
+            map.entry(key.to_string()).or_default().push(value.to_string());
+        }
+    }
+    map
 }
 
 mod bytes_as_base64 {

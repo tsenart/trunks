@@ -27,5 +27,6 @@ tokio              = { workspace = true, features = ["full"]}
 tokio-util         = { workspace = true, features = []}
 url                = { workspace = true }
 num_cpus           = { workspace = true }
+tower-service      = { workspace = true }
 tabwriter          = "1"
 tdigest            = "0.2"
