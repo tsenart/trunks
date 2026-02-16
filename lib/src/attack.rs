@@ -1,7 +1,7 @@
 use futures::Stream;
 use hyper::body::to_bytes;
 use hyper::client::HttpConnector;
-use hyper::{Body, Client, Request};
+use hyper::{Body, Client, Method, Request, Uri};
 use hyper_rustls::HttpsConnector;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 use tokio::io::AsyncBufRead;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
+use url::Url;
 
 use crate::hit::Hit;
 use crate::pacer::Pacer;
@@ -25,6 +26,8 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub max_workers: usize,
     pub timeout: Duration,
     pub max_body: i64,
+    pub redirects: i32,
+    pub chunked: bool,
 }
 
 impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
@@ -43,6 +46,8 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
                 self.name.clone(),
                 self.timeout,
                 self.max_body,
+                self.redirects,
+                self.chunked,
             ));
         }
 
@@ -59,6 +64,8 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
             self.name.clone(),
             self.timeout,
             self.max_body,
+            self.redirects,
+            self.chunked,
         ));
 
         Box::pin(hit_recv)
@@ -72,9 +79,21 @@ async fn worker(
     name: String,
     timeout: Duration,
     max_body: i64,
+    redirects: i32,
+    chunked: bool,
 ) {
     while let Ok((count, target)) = target_recv.recv().await {
-        let result = hit(name.clone(), client.clone(), count, target, timeout, max_body).await;
+        let result = hit(
+            name.clone(),
+            client.clone(),
+            count,
+            target,
+            timeout,
+            max_body,
+            redirects,
+            chunked,
+        )
+        .await;
         let _ = hit_send.send(result).await;
     }
 }
@@ -92,6 +111,8 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     name: String,
     timeout: Duration,
     max_body: i64,
+    redirects: i32,
+    chunked: bool,
 ) {
     let mut count: u64 = 0;
     let mut workers = workers;
@@ -147,6 +168,8 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
                         name.clone(),
                         timeout,
                         max_body,
+                        redirects,
+                        chunked,
                     ));
                     // Fall through to blocking send with the returned pair.
                     let target = pair.1;
@@ -196,6 +219,24 @@ const MIN_SLEEP: Duration = Duration::from_millis(16);
 #[cfg(not(any(unix, windows)))]
 const MIN_SLEEP: Duration = Duration::from_millis(1);
 
+fn is_redirect(status: hyper::StatusCode) -> bool {
+    matches!(
+        status,
+        hyper::StatusCode::MOVED_PERMANENTLY
+            | hyper::StatusCode::FOUND
+            | hyper::StatusCode::SEE_OTHER
+            | hyper::StatusCode::TEMPORARY_REDIRECT
+            | hyper::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn authority_of(uri: &Uri) -> String {
+    uri.authority()
+        .map(|a| a.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 async fn hit(
     attack: String,
     client: hyper::Client<HttpsConnector<HttpConnector>>,
@@ -203,23 +244,62 @@ async fn hit(
     target: Arc<Target>,
     timeout: Duration,
     max_body: i64,
+    redirects: i32,
+    chunked: bool,
 ) -> eyre::Result<Hit> {
     let method = target.method.to_string();
     let url = target.url.to_string();
     let timestamp = SystemTime::now();
     let began = Instant::now();
-    let mut req = Request::builder().method(&target.method).uri(&target.url);
-    if let Some(headers) = req.headers_mut() {
-        *headers = target.headers.clone();
-    }
-    let req = req.body(Body::from(target.body.clone()))?;
 
-    let res = if timeout.is_zero() {
-        client.request(req).await
-    } else {
-        match tokio::time::timeout(timeout, client.request(req)).await {
+    let mut current_method = target.method.clone();
+    let mut current_uri = target.url.clone();
+    let mut current_body = target.body.clone();
+    let mut current_headers = target.headers.clone();
+    let mut last_code: u16 = 0;
+    let original_authority = authority_of(&target.url);
+
+    for redirects_followed in 0..=redirects.max(0) as u32 {
+        let mut req = Request::builder().method(&current_method).uri(&current_uri);
+        if let Some(headers) = req.headers_mut() {
+            *headers = current_headers.clone();
+        }
+        let body = if chunked && !current_body.is_empty() {
+            let bytes = current_body.clone();
+            Body::wrap_stream(futures::stream::once(async move {
+                Ok::<_, std::io::Error>(bytes)
+            }))
+        } else {
+            Body::from(current_body.clone())
+        };
+        let req = req.body(body)?;
+
+        let res = if timeout.is_zero() {
+            client.request(req).await
+        } else {
+            match tokio::time::timeout(timeout, client.request(req)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Ok(Hit {
+                        attack,
+                        seq,
+                        code: 0,
+                        timestamp,
+                        latency: began.elapsed(),
+                        bytes_out: 0,
+                        bytes_in: 0,
+                        error: "request timed out".to_string(),
+                        body: vec![],
+                        method,
+                        url,
+                    })
+                }
+            }
+        };
+
+        let res = match res {
             Ok(res) => res,
-            Err(_) => {
+            Err(err) => {
                 return Ok(Hit {
                     attack,
                     seq,
@@ -228,52 +308,99 @@ async fn hit(
                     latency: began.elapsed(),
                     bytes_out: 0,
                     bytes_in: 0,
-                    error: "request timed out".to_string(),
+                    error: err.to_string(),
                     body: vec![],
                     method,
                     url,
                 })
             }
-        }
-    };
+        };
 
-    let res = match res {
-        Ok(res) => res,
-        Err(err) => {
+        let status = res.status();
+        last_code = status.as_u16();
+
+        if !is_redirect(status) || redirects < 0 {
+            let mut body = to_bytes(res.into_body()).await?.to_vec();
+            if max_body >= 0 {
+                body.truncate(max_body as usize);
+            }
+
             return Ok(Hit {
                 attack,
                 seq,
-                code: 0,
+                code: last_code,
                 timestamp,
                 latency: began.elapsed(),
-                bytes_out: 0,
-                bytes_in: 0,
-                error: err.to_string(),
-                body: vec![],
+                bytes_out: current_body.len() as u64,
+                bytes_in: body.len() as u64,
+                error: String::default(),
+                body,
                 method,
                 url,
-            })
+            });
         }
-    };
 
-    let code = res.status().as_u16();
-    let mut body = to_bytes(res.into_body()).await?.to_vec();
-    if max_body >= 0 {
-        body.truncate(max_body as usize);
+        if redirects_followed == redirects as u32 {
+            let _ = to_bytes(res.into_body()).await?;
+            break;
+        }
+
+        let location = match res.headers().get(hyper::header::LOCATION) {
+            Some(loc) => loc.to_str()?.to_string(),
+            None => {
+                let _ = to_bytes(res.into_body()).await?;
+                break;
+            }
+        };
+
+        let _ = to_bytes(res.into_body()).await?;
+
+        current_uri = resolve_redirect(&current_uri, &location)?;
+
+        // Strip sensitive headers on cross-authority redirects.
+        let new_authority = authority_of(&current_uri);
+        if new_authority != original_authority {
+            current_headers.remove(hyper::header::AUTHORIZATION);
+            current_headers.remove(hyper::header::COOKIE);
+        }
+
+        // 301/302: POST → GET and drop body (matching Go net/http behavior).
+        // 303: any method → GET and drop body.
+        match status {
+            hyper::StatusCode::MOVED_PERMANENTLY | hyper::StatusCode::FOUND => {
+                if current_method == Method::POST {
+                    current_method = Method::GET;
+                    current_body = hyper::body::Bytes::new();
+                }
+            }
+            hyper::StatusCode::SEE_OTHER => {
+                current_method = Method::GET;
+                current_body = hyper::body::Bytes::new();
+            }
+            _ => {} // 307/308 preserve method and body
+        }
     }
-    let latency = began.elapsed();
 
     Ok(Hit {
         attack,
         seq,
-        code,
+        code: last_code,
         timestamp,
-        latency,
-        bytes_out: target.body.len() as u64,
-        bytes_in: body.len() as u64,
-        error: String::default(),
-        body,
+        latency: began.elapsed(),
+        bytes_out: current_body.len() as u64,
+        bytes_in: 0,
+        error: format!("stopped after {} redirects", redirects),
+        body: vec![],
         method,
         url,
     })
+}
+
+fn resolve_redirect(base: &Uri, location: &str) -> eyre::Result<Uri> {
+    let base_url = Url::parse(&base.to_string())
+        .map_err(|e| eyre::eyre!("invalid base URL {:?}: {}", base, e))?;
+    let resolved = base_url
+        .join(location)
+        .map_err(|e| eyre::eyre!("invalid redirect location {:?}: {}", location, e))?;
+    Ok(resolved.as_str().parse::<Uri>()?)
 }

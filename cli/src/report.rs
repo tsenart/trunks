@@ -1,7 +1,8 @@
 use clap::Args;
+use duration_string::DurationString;
 use eyre::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use trunks::{Codec, CsvCodec, Histogram, JsonCodec, Metrics};
+use trunks::{Codec, CsvCodec, Histogram, JsonCodec, Metrics, MsgpackCodec};
 
 use crate::attack::{Input, Output};
 
@@ -18,6 +19,10 @@ pub struct Opts {
     /// Histogram buckets, e.g. "[0,1ms,10ms]"
     #[clap(long, default_value = "")]
     pub buckets: String,
+
+    /// Periodic reporting interval (e.g. "1s", "5s"). Streams reports at this interval.
+    #[clap(long)]
+    pub every: Option<DurationString>,
 
     /// Input files [default: stdin]
     pub files: Vec<String>,
@@ -37,47 +42,113 @@ pub async fn report(opts: &Opts) -> Result<()> {
         None
     };
 
-    for source in &sources {
-        let mut input = Input::from_filename(source).await?;
+    let mut output = Output::from_filename(&opts.output).await?;
 
-        // Auto-detect encoding by peeking at first byte.
-        let buf = input.fill_buf().await?;
-        if buf.is_empty() {
-            continue;
-        }
-        let is_json = buf[0] == b'{';
+    if let Some(ref every_dur) = opts.every {
+        let interval_dur: std::time::Duration = (*every_dur).into();
+        let mut ticker = tokio::time::interval(interval_dur);
+        ticker.tick().await; // consume the immediate first tick
 
-        loop {
-            let result = if is_json {
-                JsonCodec.decode(&mut input).await
+        for source in &sources {
+            let mut input = Input::from_filename(source).await?;
+            let buf = input.fill_buf().await?;
+            if buf.is_empty() {
+                continue;
+            }
+            let first = buf[0];
+            let input_format = if first == b'{' {
+                "json"
+            } else if first.is_ascii_graphic() {
+                "csv"
             } else {
-                CsvCodec.decode(&mut input).await
+                "msgpack"
             };
-            match result {
-                Ok(hit) => {
-                    if let Some(ref mut h) = histogram {
-                        h.add(&hit);
+
+            let mut done = false;
+            while !done {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        write_report(opts, &mut metrics, &mut histogram, &mut output).await?;
+                        metrics = Metrics::new();
+                        if let Some(ref mut h) = histogram {
+                            *h = Histogram::from_bucket_str(&opts.buckets)?;
+                        }
                     }
-                    metrics.add(&hit);
+                    result = decode_hit(&mut input, input_format) => {
+                        match result {
+                            Ok(hit) => {
+                                if let Some(ref mut h) = histogram {
+                                    h.add(&hit);
+                                }
+                                metrics.add(&hit);
+                            }
+                            Err(_) => { done = true; }
+                        }
+                    }
                 }
-                Err(_) => break,
             }
         }
+        // Final report for remaining data.
+        write_report(opts, &mut metrics, &mut histogram, &mut output).await
+    } else {
+        for source in &sources {
+            let mut input = Input::from_filename(source).await?;
+            let buf = input.fill_buf().await?;
+            if buf.is_empty() {
+                continue;
+            }
+            let first = buf[0];
+            let input_format = if first == b'{' {
+                "json"
+            } else if first.is_ascii_graphic() {
+                "csv"
+            } else {
+                "msgpack"
+            };
+
+            loop {
+                match decode_hit(&mut input, input_format).await {
+                    Ok(hit) => {
+                        if let Some(ref mut h) = histogram {
+                            h.add(&hit);
+                        }
+                        metrics.add(&hit);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        write_report(opts, &mut metrics, &mut histogram, &mut output).await
     }
+}
 
+async fn decode_hit(input: &mut Input, format: &str) -> eyre::Result<trunks::Hit> {
+    match format {
+        "json" => JsonCodec.decode(input).await,
+        "csv" => CsvCodec.decode(input).await,
+        _ => MsgpackCodec.decode(input).await,
+    }
+}
+
+async fn write_report(
+    opts: &Opts,
+    metrics: &mut Metrics,
+    histogram: &mut Option<Histogram>,
+    output: &mut (impl AsyncWriteExt + Unpin),
+) -> Result<()> {
     metrics.close();
-
-    let mut output = Output::from_filename(&opts.output).await?;
 
     let mut buf = Vec::new();
     match opts.report_type.as_str() {
-        "text" => trunks::report_text(&metrics, &mut buf)?,
-        "json" => trunks::report_json(&metrics, &mut buf)?,
+        "text" => trunks::report_text(metrics, &mut buf)?,
+        "json" => trunks::report_json(metrics, &mut buf)?,
         "hist" => {
-            let h = histogram.ok_or_else(|| eyre::eyre!("--buckets is required for hist report"))?;
-            trunks::report_histogram(&h, &mut buf)?;
+            let h = histogram
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("--buckets is required for hist report"))?;
+            trunks::report_histogram(h, &mut buf)?;
         }
-        "hdrplot" => trunks::report_hdrplot(&metrics, &mut buf)?,
+        "hdrplot" => trunks::report_hdrplot(metrics, &mut buf)?,
         other => eyre::bail!("unknown report type: {}", other),
     }
     output.write_all(&buf).await?;

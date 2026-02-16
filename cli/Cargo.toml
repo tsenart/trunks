@@ -21,9 +21,11 @@ clap             = { workspace = true, features = ["default", "derive", "env" ]}
 duration-string  = { workspace = true }
 eyre             = { workspace = true, features = ["default"]}
 futures          = { workspace = true }
-hyper            = { workspace = true, features = ["client", "http1", "http2", "runtime", "stream"]}
+hyper            = { workspace = true, features = ["client", "http1", "http2", "runtime", "server", "stream", "tcp"]}
 hyper-rustls     = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
 serde_json       = { workspace = true }
 tokio            = { workspace = true, features = ["fs", "io-util", "io-std", "signal", "macros", "rt-multi-thread"]}
 num_cpus         = { workspace = true }
 rustls           = { version = "0.21", default-features = false, features = ["dangerous_configuration"] }
+rustls-native-certs = { workspace = true }
+rustls-pemfile   = { workspace = true }

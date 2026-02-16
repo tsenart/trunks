@@ -146,6 +146,30 @@ impl Codec for CsvCodec {
     }
 }
 
+pub struct MsgpackCodec;
+
+#[async_trait]
+impl Codec for MsgpackCodec {
+    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
+        let data = rmp_serde::to_vec(hit)?;
+        let len = (data.len() as u32).to_be_bytes();
+        writer.write_all(&len).await?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
+        use tokio::io::AsyncReadExt;
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut data = vec![0u8; len];
+        reader.read_exact(&mut data).await?;
+        rmp_serde::from_slice(&data).map_err(|e| eyre::eyre!(e))
+    }
+}
+
 pub mod duration_as_nanos {
     use serde::{self, Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -164,6 +188,73 @@ pub mod duration_as_nanos {
     {
         let nanos = u64::deserialize(deserializer)?;
         Ok(Duration::from_nanos(nanos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn msgpack_round_trip() {
+        let hit = Hit {
+            attack: "test".to_string(),
+            seq: 42,
+            code: 200,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(123),
+            bytes_out: 64,
+            bytes_in: 512,
+            error: String::new(),
+            body: vec![1, 2, 3, 4],
+            method: "POST".to_string(),
+            url: "http://localhost:8080/api".to_string(),
+        };
+
+        let mut buf = Vec::new();
+        MsgpackCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = MsgpackCodec
+            .decode(&mut reader)
+            .await
+            .expect("decode failed");
+
+        assert_eq!(hit, decoded);
+    }
+
+    #[tokio::test]
+    async fn msgpack_round_trip_with_error() {
+        let hit = Hit {
+            attack: "err-test".to_string(),
+            seq: 1,
+            code: 0,
+            timestamp: UNIX_EPOCH + Duration::from_secs(1700000000),
+            latency: Duration::from_millis(5000),
+            bytes_out: 0,
+            bytes_in: 0,
+            error: "connection refused".to_string(),
+            body: vec![],
+            method: "GET".to_string(),
+            url: "http://unreachable:9999/".to_string(),
+        };
+
+        let mut buf = Vec::new();
+        MsgpackCodec
+            .encode(&mut buf, &hit)
+            .await
+            .expect("encode failed");
+
+        let mut reader = &buf[..];
+        let decoded = MsgpackCodec
+            .decode(&mut reader)
+            .await
+            .expect("decode failed");
+
+        assert_eq!(hit, decoded);
     }
 }
 

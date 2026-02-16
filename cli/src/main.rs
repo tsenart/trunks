@@ -1,11 +1,15 @@
 mod attack;
 mod encode;
+mod plot;
 mod report;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "trunks", about = "Son of Vegeta — a powerful HTTP load testing tool written in Rust")]
+#[command(
+    name = "trunks",
+    about = "Son of Vegeta — a powerful HTTP load testing tool written in Rust"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -17,6 +21,8 @@ enum Command {
     Attack(attack::Opts),
     /// Generate reports from attack results
     Report(report::Opts),
+    /// Generate HTML plot from attack results
+    Plot(plot::Opts),
     /// Transcode attack results between encodings
     Encode(encode::Opts),
 }
@@ -27,6 +33,7 @@ async fn main() -> eyre::Result<()> {
     match cli.command {
         Command::Attack(opts) => attack::attack(&opts).await,
         Command::Report(opts) => report::report(&opts).await,
+        Command::Plot(opts) => plot::plot(&opts).await,
         Command::Encode(opts) => encode::encode(&opts).await,
     }
 }
