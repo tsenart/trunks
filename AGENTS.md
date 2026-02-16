@@ -108,10 +108,53 @@ CI runs on every push/PR via `.github/workflows/ci.yml`. Three jobs:
 # 4. Tag and push:
 git tag v0.X.Y && git push origin v0.X.Y
 # 5. CI builds all targets, creates draft release, publishes to crates.io
-# 6. Go to GitHub Releases and un-draft the release
+# 6. Write release notes (see below), un-draft the release on GitHub
 ```
 
 **Versioning:** use semver. Bump minor for breaking API changes (pub types, builder API, trait changes). The lib crate is published to crates.io — breaking changes matter.
+
+### Release notes
+
+CI auto-generates a commit list, but **always replace it with proper release notes**. Write them for humans — users and contributors, not git log readers.
+
+Structure:
+
+```markdown
+## What's new
+
+One paragraph summary of the release theme. What should users care about?
+
+### Breaking changes ⚠️
+<!-- Only for minor/major bumps. Be specific about what broke and how to migrate. -->
+- `Attack` fields are now private. Use `Attack::builder()` instead of struct literals.
+- `Codec` trait removed. Call methods directly on `JsonCodec`/`CsvCodec`/`MsgpackCodec`.
+
+### Improvements
+<!-- Group by area. Lead with the user-facing benefit, not the implementation. -->
+- **DNS:** async resolution with transaction ID validation — no more `spawn_blocking` per query
+- **Memory:** response bodies stream up to `max_body` bytes instead of buffering entirely
+- **Performance:** status codes use `u16` keys instead of allocating strings per request
+
+### Bug fixes
+- Fixed panic when request count exceeds `u32::MAX` (mean latency division)
+- Fixed double-close producing zero percentiles in metrics
+- Msgpack decoder rejects frames > 64MB before allocating
+
+### Internal
+<!-- Optional — only if contributors would care. -->
+- 90 tests covering all fixes
+- Body file reads cached via `HashMap<String, Bytes>`
+```
+
+Rules:
+- **Lead with impact, not implementation.** "Response bodies stream up to max_body" not "replaced to_bytes with read_body helper".
+- **Breaking changes get migration instructions.** Show the old way → new way.
+- **Group by user concern** (not by file or issue number).
+- **Be concise.** One line per item. No commit hashes in release notes.
+- **Include the install/upgrade snippet** if the crate version changed:
+  ```
+  cargo install trunks-cli   # or: brew upgrade tsenart/tap/trunks
+  ```
 
 ## Common Pitfalls
 
