@@ -25,19 +25,15 @@ pub trait TargetRead: Send {
     async fn decode(&mut self) -> Result<Arc<Target>>;
 }
 
+#[derive(Default)]
 pub enum Targets {
+    #[default]
     None,
     Static {
         pos: Arc<AtomicUsize>,
         targets: Vec<Arc<Target>>,
     },
     Lazy(Box<dyn TargetRead>),
-}
-
-impl Default for Targets {
-    fn default() -> Self {
-        Targets::None
-    }
 }
 
 impl std::fmt::Debug for Targets {
