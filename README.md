@@ -406,7 +406,7 @@ Add the `trunks` crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-trunks = "0.1"
+trunks = "0.2"
 ```
 
 ```rust

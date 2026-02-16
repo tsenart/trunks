@@ -1,6 +1,6 @@
 [package]
 name                   = "trunks-cli"
-version                = "0.1.2"
+version                = "0.2.0"
 authors.workspace      = true
 readme                 = "../README.md"
 edition.workspace      = true
@@ -16,7 +16,7 @@ name = "trunks"
 path = "src/main.rs"
 
 [dependencies]
-trunks = { path = "../lib", version = "0.1.2" }
+trunks = { path = "../lib", version = "0.2.0" }
 
 async-trait      = { workspace = true }
 clap             = { workspace = true, features = ["default", "derive", "env" ]}
