@@ -425,27 +425,21 @@ async fn main() -> eyre::Result<()> {
         ..Default::default()
     });
 
-    let targets: Targets<tokio::io::Empty> = vec![target].into();
+    let targets: Targets = vec![target].into();
     let stop = CancellationToken::new();
 
     let client = hyper::Client::new();
-    let atk = Attack {
-        name: "example".to_string(),
-        client,
-        duration: Duration::from_secs(5),
-        pacer: Arc::new(ConstantPacer {
-            freq: 50,
-            per: Duration::from_secs(1),
-        }),
-        targets: Arc::new(Mutex::new(targets)),
-        workers: 4,
-        max_workers: 16,
-        timeout: Duration::from_secs(30),
-        max_body: -1,
-        redirects: 10,
-        chunked: false,
-        stop,
-    };
+    let pacer = Arc::new(ConstantPacer {
+        freq: 50,
+        per: Duration::from_secs(1),
+    });
+
+    let atk = Attack::builder("example", client, pacer, Arc::new(Mutex::new(targets)))
+        .duration(Duration::from_secs(5))
+        .workers(4)
+        .max_workers(16)
+        .stop(stop)
+        .build();
 
     let mut hits = atk.run();
     while let Some(result) = hits.next().await {
