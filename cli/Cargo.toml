@@ -23,5 +23,7 @@ eyre             = { workspace = true, features = ["default"]}
 futures          = { workspace = true }
 hyper            = { workspace = true, features = ["client", "http1", "http2", "runtime", "stream"]}
 hyper-rustls     = { workspace = true, features = ["http1", "http2", "logging", "native-tokio", "tls12"]}
-tokio            = { workspace = true, features = ["fs", "io-util", "io-std"]}
+serde_json       = { workspace = true }
+tokio            = { workspace = true, features = ["fs", "io-util", "io-std", "signal", "macros", "rt-multi-thread"]}
 num_cpus         = { workspace = true }
+rustls           = { version = "0.21", default-features = false, features = ["dangerous_configuration"] }

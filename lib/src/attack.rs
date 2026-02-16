@@ -9,7 +9,6 @@ use std::time::{Instant, SystemTime};
 use tokio::io::AsyncBufRead;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
-// use tokio_util::sync::CancellationToken;
 
 use crate::hit::Hit;
 use crate::pacer::Pacer;
@@ -24,11 +23,16 @@ pub struct Attack<P: Pacer, R: AsyncBufRead + Send> {
     pub targets: Arc<Mutex<Targets<R>>>,
     pub workers: usize,
     pub max_workers: usize,
+    pub timeout: Duration,
+    pub max_body: i64,
 }
 
 impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
-        let (target_send, target_recv) = async_channel::unbounded::<(u64, Arc<Target>)>();
+        // Bounded(1) channel acts like Go's unbuffered channel: sends block
+        // until a worker is ready to receive, enabling backpressure and
+        // dynamic worker scaling.
+        let (target_send, target_recv) = async_channel::bounded::<(u64, Arc<Target>)>(1);
         let (hit_send, hit_recv) = async_channel::unbounded::<eyre::Result<Hit>>();
 
         for _ in 0..self.workers {
@@ -37,6 +41,8 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
                 hit_send.clone(),
                 self.client.clone(),
                 self.name.clone(),
+                self.timeout,
+                self.max_body,
             ));
         }
 
@@ -45,6 +51,14 @@ impl<P: Pacer + 'static, R: AsyncBufRead + Send + Sync + 'static> Attack<P, R> {
             self.pacer.clone(),
             self.targets.clone(),
             target_send,
+            self.workers,
+            self.max_workers,
+            target_recv,
+            hit_send,
+            self.client.clone(),
+            self.name.clone(),
+            self.timeout,
+            self.max_body,
         ));
 
         Box::pin(hit_recv)
@@ -56,9 +70,11 @@ async fn worker(
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
     client: hyper::Client<HttpsConnector<HttpConnector>>,
     name: String,
+    timeout: Duration,
+    max_body: i64,
 ) {
     while let Ok((count, target)) = target_recv.recv().await {
-        let result = hit(name.clone(), client.clone(), count, target).await;
+        let result = hit(name.clone(), client.clone(), count, target, timeout, max_body).await;
         let _ = hit_send.send(result).await;
     }
 }
@@ -68,14 +84,30 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
     pacer: Arc<P>,
     targets: Arc<Mutex<Targets<R>>>,
     target_send: async_channel::Sender<(u64, Arc<Target>)>,
+    workers: usize,
+    max_workers: usize,
+    target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
+    hit_send: async_channel::Sender<eyre::Result<Hit>>,
+    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    name: String,
+    timeout: Duration,
+    max_body: i64,
 ) {
     let mut count: u64 = 0;
+    let mut workers = workers;
     let began = Instant::now();
+    let deadline = if duration.is_zero() {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + duration)
+    };
 
     loop {
         let elapsed = began.elapsed();
-        if !duration.is_zero() && elapsed > duration {
-            break;
+        if let Some(dl) = deadline {
+            if tokio::time::Instant::now() >= dl {
+                break;
+            }
         }
 
         let (wait, stop) = pacer.pace(elapsed, count);
@@ -92,18 +124,66 @@ async fn attack<P: Pacer, R: AsyncBufRead + Send + Sync>(
         }
 
         count += 1;
-        match targets.lock().await.decode().await {
-            Ok(target) => {
-                let _ = target_send.send((count, target)).await;
-            }
+        let target = match targets.lock().await.decode().await {
+            Ok(target) => target,
             Err(e) => {
                 eprintln!("Error decoding target: {}", e);
                 return;
             }
+        };
+
+        // Dynamic worker scaling: if all workers are busy (try_send fails)
+        // and we haven't reached max_workers, spawn a new worker then fall
+        // through to the blocking send. Mirrors vegeta's lib/attack.go.
+        if workers < max_workers {
+            match target_send.try_send((count, target)) {
+                Ok(()) => continue,
+                Err(async_channel::TrySendError::Full(pair)) => {
+                    workers += 1;
+                    tokio::spawn(worker(
+                        target_recv.clone(),
+                        hit_send.clone(),
+                        client.clone(),
+                        name.clone(),
+                        timeout,
+                        max_body,
+                    ));
+                    // Fall through to blocking send with the returned pair.
+                    let target = pair.1;
+                    if let Some(dl) = deadline {
+                        if tokio::time::timeout_at(dl, target_send.send((count, target)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    } else {
+                        let _ = target_send.send((count, target)).await;
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(async_channel::TrySendError::Closed(_)) => break,
+            }
+        }
+
+        // At max_workers: blocking send with deadline.
+        if let Some(dl) = deadline {
+            if tokio::time::timeout_at(dl, target_send.send((count, target)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        } else {
+            let _ = target_send.send((count, target)).await;
         }
 
         tokio::task::yield_now().await;
     }
+    // target_send and hit_send are dropped here, closing the channels.
+    // Workers drain the bounded buffer (at most 1 item) and exit.
+    // hit_recv stream ends when the last worker's hit_send clone drops.
 }
 
 #[cfg(unix)]
@@ -121,6 +201,8 @@ async fn hit(
     client: hyper::Client<HttpsConnector<HttpConnector>>,
     seq: u64,
     target: Arc<Target>,
+    timeout: Duration,
+    max_body: i64,
 ) -> eyre::Result<Hit> {
     let method = target.method.to_string();
     let url = target.url.to_string();
@@ -131,7 +213,31 @@ async fn hit(
         *headers = target.headers.clone();
     }
     let req = req.body(Body::from(target.body.clone()))?;
-    let res = match client.request(req).await {
+
+    let res = if timeout.is_zero() {
+        client.request(req).await
+    } else {
+        match tokio::time::timeout(timeout, client.request(req)).await {
+            Ok(res) => res,
+            Err(_) => {
+                return Ok(Hit {
+                    attack,
+                    seq,
+                    code: 0,
+                    timestamp,
+                    latency: began.elapsed(),
+                    bytes_out: 0,
+                    bytes_in: 0,
+                    error: "request timed out".to_string(),
+                    body: vec![],
+                    method,
+                    url,
+                })
+            }
+        }
+    };
+
+    let res = match res {
         Ok(res) => res,
         Err(err) => {
             return Ok(Hit {
@@ -151,7 +257,10 @@ async fn hit(
     };
 
     let code = res.status().as_u16();
-    let body = to_bytes(res.into_body()).await?.to_vec();
+    let mut body = to_bytes(res.into_body()).await?.to_vec();
+    if max_body >= 0 {
+        body.truncate(max_body as usize);
+    }
     let latency = began.elapsed();
 
     Ok(Hit {
