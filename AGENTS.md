@@ -73,9 +73,45 @@ CLI (clap)
 ```sh
 cargo build              # Debug build
 cargo build --release    # Release (LTO=fat, codegen-units=1)
-cargo test               # Run all 90 tests
+cargo test --all         # Run all 90 tests
 cargo fmt --check        # Verify formatting
+cargo clippy -- -D warnings  # Lint (CI runs this, must pass)
 ```
+
+## CI & Release
+
+CI runs on every push/PR via `.github/workflows/ci.yml`. Three jobs:
+
+1. **QA** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --all`. Runs on all pushes and PRs.
+2. **Build** — cross-compiles 7 targets (only on `v*.*.*` tags). Uploads `.tar.gz`/`.zip` artifacts.
+3. **Release** — creates a **draft** GitHub Release with auto-generated notes, checksums, and all build artifacts.
+4. **Publish** — publishes `trunks` (lib) then `trunks-cli` to crates.io via OIDC token.
+
+### Build targets
+
+| Target | OS | Cross |
+|--------|----|-------|
+| `x86_64-unknown-linux-gnu` | ubuntu | no |
+| `x86_64-unknown-linux-musl` | ubuntu | yes |
+| `aarch64-unknown-linux-gnu` | ubuntu | yes |
+| `aarch64-unknown-linux-musl` | ubuntu | yes |
+| `x86_64-apple-darwin` | macos | no |
+| `aarch64-apple-darwin` | macos | no |
+| `x86_64-pc-windows-msvc` | windows | no |
+
+### Release process
+
+```sh
+# 1. Bump version in lib/Cargo.toml, cli/Cargo.toml, cli's trunks dep
+# 2. Update README.md crate version if needed
+# 3. Commit, push to main
+# 4. Tag and push:
+git tag v0.X.Y && git push origin v0.X.Y
+# 5. CI builds all targets, creates draft release, publishes to crates.io
+# 6. Go to GitHub Releases and un-draft the release
+```
+
+**Versioning:** use semver. Bump minor for breaking API changes (pub types, builder API, trait changes). The lib crate is published to crates.io — breaking changes matter.
 
 ## Common Pitfalls
 
