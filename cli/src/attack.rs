@@ -171,6 +171,10 @@ pub struct Opts {
     /// DNS cache TTL (0s = cache forever, omit = no cache)
     #[clap(long = "dns-ttl")]
     dns_ttl: Option<DurationString>,
+
+    /// Custom DNS resolver addresses (repeatable), format "ip[:port]"
+    #[clap(long = "resolvers")]
+    resolvers: Vec<String>,
 }
 
 const HISTOGRAM_BUCKETS: &[f64] = &[
@@ -456,7 +460,26 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         })
         .collect();
     let dns_ttl = opts.dns_ttl.as_ref().map(|d| -> Duration { d.clone().into() });
-    let resolver = trunks::TrunksResolver::new(connect_to_map, dns_ttl);
+    let resolver = trunks::TrunksResolver::new(connect_to_map, dns_ttl, opts.resolvers.clone());
+
+    // Parse --proxy-header flags into HashMap<String, String>
+    let proxy_headers: std::collections::HashMap<String, String> = opts
+        .proxy_headers
+        .iter()
+        .filter_map(|h| {
+            let (k, v) = h.split_once(':')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    let proxy_config = trunks::ProxyConfig::from_env(proxy_headers);
+    if proxy_config.is_enabled() {
+        if let Some(ref p) = proxy_config.http_proxy {
+            eprintln!("Using HTTP proxy: {}", p);
+        }
+        if let Some(ref p) = proxy_config.https_proxy {
+            eprintln!("Using HTTPS proxy: {}", p);
+        }
+    }
 
     // Build HTTP connector with custom resolver and local address binding
     let mut http = HttpConnector::new_with_resolver(resolver);
@@ -467,6 +490,9 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             .map_err(|_| eyre::eyre!("invalid local address: {}", addr))?;
         http.set_local_address(Some(ip));
     }
+
+    // Wrap with proxy connector (transparent pass-through when no proxy is configured)
+    let http = trunks::ProxyConnector::new(http, proxy_config.clone());
 
     // Build HTTP client pool settings
     let mut client_builder = Client::builder();
