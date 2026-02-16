@@ -21,22 +21,39 @@ pub struct Target {
 }
 
 #[async_trait]
-pub trait TargetRead<R: AsyncBufRead> {
+pub trait TargetRead: Send {
     async fn decode(&mut self) -> Result<Arc<Target>>;
 }
 
-#[derive(Default, Debug)]
-pub enum Targets<R: AsyncBufRead + Send> {
-    #[default]
+pub enum Targets {
     None,
     Static {
         pos: Arc<AtomicUsize>,
         targets: Vec<Arc<Target>>,
     },
-    Lazy(TargetReader<R>),
+    Lazy(Box<dyn TargetRead>),
 }
 
-impl<R: AsyncBufRead + Send> From<Vec<Arc<Target>>> for Targets<R> {
+impl Default for Targets {
+    fn default() -> Self {
+        Targets::None
+    }
+}
+
+impl std::fmt::Debug for Targets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Targets::None => f.debug_tuple("Targets::None").finish(),
+            Targets::Static { targets, .. } => f
+                .debug_struct("Targets::Static")
+                .field("len", &targets.len())
+                .finish(),
+            Targets::Lazy(_) => f.debug_tuple("Targets::Lazy").field(&"..").finish(),
+        }
+    }
+}
+
+impl From<Vec<Arc<Target>>> for Targets {
     fn from(targets: Vec<Arc<Target>>) -> Self {
         Self::Static {
             pos: Arc::new(AtomicUsize::new(0)),
@@ -46,7 +63,7 @@ impl<R: AsyncBufRead + Send> From<Vec<Arc<Target>>> for Targets<R> {
 }
 
 #[async_trait]
-impl<R: AsyncBufRead + Send> TargetRead<R> for Targets<R> {
+impl TargetRead for Targets {
     async fn decode(&mut self) -> Result<Arc<Target>> {
         match self {
             Targets::None => eyre::bail!("no targets"),
@@ -104,7 +121,7 @@ impl<R: AsyncBufRead> TargetReader<R> {
 }
 
 #[async_trait]
-impl<R: AsyncBufRead + Send> TargetRead<R> for TargetReader<R> {
+impl<R: AsyncBufRead + Send> TargetRead for TargetReader<R> {
     async fn decode(&mut self) -> Result<Arc<Target>> {
         match self {
             TargetReader::Json(tr) => decode_json(&mut tr.input, &tr.defaults).await,
@@ -309,7 +326,7 @@ mod tests {
             url: Uri::from_static("http://c/"),
             ..Default::default()
         });
-        let mut targets: Targets<&[u8]> = Targets::from(vec![t1, t2, t3]);
+        let mut targets: Targets = Targets::from(vec![t1, t2, t3]);
 
         let mut urls = Vec::new();
         for _ in 0..6 {
@@ -331,13 +348,13 @@ mod tests {
 
     #[tokio::test]
     async fn empty_targets_error() {
-        let mut targets: Targets<&[u8]> = Targets::None;
+        let mut targets: Targets = Targets::None;
         assert!(targets.decode().await.is_err());
     }
 
     #[tokio::test]
     async fn empty_static_targets_error() {
-        let mut targets: Targets<&[u8]> = Targets::from(vec![]);
+        let mut targets: Targets = Targets::from(vec![]);
         assert!(targets.decode().await.is_err());
     }
 

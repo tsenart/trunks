@@ -2,7 +2,7 @@
 
 Two Jon Gjengset-style reviews across the full Rust codebase (~5300 lines).
 Review #1 found 18 issues, fixed 11. Review #2 found 10 new issues.
-**All issues resolved**: 11 ✅ fixed, 6 ⏭️ deferred (4 LOW design issues, 2 MEDIUM not-a-bug).
+**All 17 issues resolved**: 14 ✅ fixed, 3 ⏭️ deferred (1 LOW + 2 MEDIUM not-a-bug/not-worth-fixing).
 
 ## Status Legend
 - ⬜ Open
@@ -24,25 +24,25 @@ Review #1 found 18 issues, fixed 11. Review #2 found 10 new issues.
 **Problem:** `self.latencies.total / self.requests as u32` — the `as u32` truncates, potentially to 0, causing divide-by-zero panic.
 **Fix:** Replaced with `self.latencies.total.div_f64(self.requests as f64)`. Test added that confirms no panic with requests > u32::MAX.
 
-### #6 ⏭️ LOW — Attack struct has all pub fields, no builder
+### #6 ✅ LOW — Attack struct has all pub fields, no builder
 **File:** `lib/src/attack.rs:30-43`
 **Problem:** All fields are `pub`, making the API fragile for library consumers. No builder or `new()` method.
-**Fix:** Add a builder pattern or `AttackBuilder`. Lower priority since this is mostly a library API design issue.
+**Fix:** Added `AttackBuilder` with `Attack::builder(name, client, pacer, targets)` constructor. Required fields (name, client, pacer, targets) are positional; optional fields (duration, workers, max_workers, timeout, max_body, redirects, chunked, stop) have sensible defaults. All fields now private.
 
-### #8 ⏭️ LOW — Codec trait uses async_trait boxing in hot path
+### #8 ✅ LOW — Codec trait uses async_trait boxing in hot path
 **File:** `lib/src/hit.rs:37-41`
 **Problem:** `#[async_trait]` adds a `Box::pin` allocation on every `encode`/`decode` call. In the attack hot loop, this is per-request overhead.
-**Fix:** Use manual `Future` impls, or accept the cost as negligible vs network I/O. Deferred — would require significant refactoring.
+**Fix:** Removed the `Codec` trait entirely. `JsonCodec`, `CsvCodec`, `MsgpackCodec` now have inherent `async fn encode`/`decode` methods. The trait was never used for dynamic dispatch (`dyn Codec`), only to bring methods into scope. Zero boxing overhead.
 
-### #9 ⏭️ LOW — Targets enum generic over R even for Static variant
+### #9 ✅ LOW — Targets enum generic over R even for Static variant
 **File:** `lib/src/target.rs:29-37`
 **Problem:** `Targets<R: AsyncBufRead>` forces a type parameter even for `Static` which doesn't use `R`. This bleeds into `Attack<C, P, R>`.
-**Fix:** Use an enum with `Box<dyn TargetRead>` or split into separate types. Deferred — would require significant refactoring.
+**Fix:** Made `TargetRead` trait non-generic and object-safe (with `Send` bound). `Targets::Lazy` now stores `Box<dyn TargetRead>`. Erased `R` from `Targets` and `Attack<C, P, R>` → `Attack<C, P>`. Manual `Debug` and `Default` impls added for `Targets`.
 
 ### #12 ⏭️ LOW — Response headers collected into HashMap on every response
 **File:** `lib/src/attack.rs:308-316`
-**Problem:** Every non-error response allocates a `HashMap<String, Vec<String>>` of response headers, even if they're never used downstream.
-**Fix:** Make header collection opt-in via a config flag, or use `HeaderMap` directly.
+**Problem:** Every non-error response allocates a `HashMap<String, Vec<String>>` of response headers.
+**Resolution:** Not worth fixing. Headers ARE used — serialized in every Hit output (JSON/CSV/msgpack). The HashMap allocation (~100-300 bytes) is negligible vs network I/O per request. Using `HeaderMap` directly would require custom serde impls for marginal gain.
 
 ### #13 ⏭️ MEDIUM — targets.lock().await holds mutex across async decode
 **File:** `lib/src/attack.rs:161`

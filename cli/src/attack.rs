@@ -19,7 +19,7 @@ use tokio::io::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use trunks::{
-    Attack, Codec, ConstantPacer, CsvCodec, JsonCodec, LinearPacer, MsgpackCodec, Pacer,
+    Attack, ConstantPacer, CsvCodec, JsonCodec, LinearPacer, MsgpackCodec, Pacer,
     PrometheusMetrics, SinePacer, TargetDefaults, TargetRead, TargetReader, Targets,
 };
 
@@ -289,7 +289,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         TargetReader::new(&opts.format, input, TargetDefaults { body, headers })?;
 
     let targets = if opts.lazy {
-        Targets::Lazy(target_reader)
+        Targets::Lazy(Box::new(target_reader))
     } else {
         let mut targets: Vec<_> = Vec::new();
         while let Ok(target) = target_reader.decode().await {
@@ -367,20 +367,16 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         let connector = trunks::UnixConnector::new(socket_path);
         let client = client_builder.build::<_, hyper::Body>(connector);
 
-        let atk = Attack {
-            client,
-            duration: opts.duration.into(),
-            name: Arc::from(opts.name.as_str()),
-            pacer,
-            targets,
-            workers: opts.workers,
-            max_workers: opts.max_workers,
-            timeout: opts.timeout.into(),
-            max_body: opts.max_body,
-            redirects: opts.redirects,
-            chunked: opts.chunked,
-            stop: stop.clone(),
-        };
+        let atk = Attack::builder(opts.name.as_str(), client, pacer, targets)
+            .duration(opts.duration.into())
+            .workers(opts.workers)
+            .max_workers(opts.max_workers)
+            .timeout(opts.timeout.into())
+            .max_body(opts.max_body)
+            .redirects(opts.redirects)
+            .chunked(opts.chunked)
+            .stop(stop.clone())
+            .build();
 
         return run_attack(atk, stop, opts, &mut output).await;
     }
@@ -391,20 +387,16 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             .http2_only(true)
             .build::<_, hyper::Body>(http);
 
-        let atk = Attack {
-            client,
-            duration: opts.duration.into(),
-            name: Arc::from(opts.name.as_str()),
-            pacer,
-            targets,
-            workers: opts.workers,
-            max_workers: opts.max_workers,
-            timeout: opts.timeout.into(),
-            max_body: opts.max_body,
-            redirects: opts.redirects,
-            chunked: opts.chunked,
-            stop: stop.clone(),
-        };
+        let atk = Attack::builder(opts.name.as_str(), client, pacer, targets)
+            .duration(opts.duration.into())
+            .workers(opts.workers)
+            .max_workers(opts.max_workers)
+            .timeout(opts.timeout.into())
+            .max_body(opts.max_body)
+            .redirects(opts.redirects)
+            .chunked(opts.chunked)
+            .stop(stop.clone())
+            .build();
 
         run_attack(atk, stop, opts, &mut output).await
     } else {
@@ -438,27 +430,23 @@ pub async fn attack(opts: &Opts) -> Result<()> {
 
         let client = client_builder.build::<_, hyper::Body>(https);
 
-        let atk = Attack {
-            client,
-            duration: opts.duration.into(),
-            name: Arc::from(opts.name.as_str()),
-            pacer,
-            targets,
-            workers: opts.workers,
-            max_workers: opts.max_workers,
-            timeout: opts.timeout.into(),
-            max_body: opts.max_body,
-            redirects: opts.redirects,
-            chunked: opts.chunked,
-            stop: stop.clone(),
-        };
+        let atk = Attack::builder(opts.name.as_str(), client, pacer, targets)
+            .duration(opts.duration.into())
+            .workers(opts.workers)
+            .max_workers(opts.max_workers)
+            .timeout(opts.timeout.into())
+            .max_body(opts.max_body)
+            .redirects(opts.redirects)
+            .chunked(opts.chunked)
+            .stop(stop.clone())
+            .build();
 
         run_attack(atk, stop, opts, &mut output).await
     }
 }
 
-async fn run_attack<C, P, R>(
-    atk: Attack<C, P, R>,
+async fn run_attack<C, P>(
+    atk: Attack<C, P>,
     stop: CancellationToken,
     opts: &Opts,
     output: &mut Output,
@@ -466,7 +454,6 @@ async fn run_attack<C, P, R>(
 where
     C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
     P: trunks::Pacer + 'static,
-    R: AsyncBufRead + Send + Sync + 'static,
 {
     let prom_metrics = Arc::new(Mutex::new(PrometheusMetrics::default()));
     if let Some(ref addr) = opts.prometheus_addr {

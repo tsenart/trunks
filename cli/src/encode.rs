@@ -1,6 +1,6 @@
 use clap::Args;
 use eyre::Result;
-use trunks::{Codec, CsvCodec, JsonCodec, MsgpackCodec};
+use trunks::{CsvCodec, JsonCodec, MsgpackCodec};
 
 use crate::attack::{Input, Output};
 

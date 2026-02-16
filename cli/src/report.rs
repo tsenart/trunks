@@ -2,7 +2,7 @@ use clap::Args;
 use duration_string::DurationString;
 use eyre::Result;
 use tokio::io::AsyncWriteExt;
-use trunks::{Codec, CsvCodec, Histogram, JsonCodec, Metrics, MsgpackCodec};
+use trunks::{CsvCodec, Histogram, JsonCodec, Metrics, MsgpackCodec};
 
 use crate::attack::{Input, Output};
 

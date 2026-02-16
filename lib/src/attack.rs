@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tokio::io::AsyncBufRead;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -27,27 +26,113 @@ struct HitConfig {
 }
 
 #[derive(Debug)]
-pub struct Attack<C, P: Pacer, R: AsyncBufRead + Send> {
-    pub name: Arc<str>,
-    pub client: Client<C>,
-    pub duration: Duration,
-    pub pacer: Arc<P>,
-    pub targets: Arc<Mutex<Targets<R>>>,
-    pub workers: usize,
-    pub max_workers: usize,
-    pub timeout: Duration,
-    pub max_body: i64,
-    pub redirects: i32,
-    pub chunked: bool,
-    pub stop: CancellationToken,
+pub struct Attack<C, P: Pacer> {
+    name: Arc<str>,
+    client: Client<C>,
+    duration: Duration,
+    pacer: Arc<P>,
+    targets: Arc<Mutex<Targets>>,
+    workers: usize,
+    max_workers: usize,
+    timeout: Duration,
+    max_body: i64,
+    redirects: i32,
+    chunked: bool,
+    stop: CancellationToken,
 }
 
-impl<
-        C: Connect + Clone + Send + Sync + 'static,
-        P: Pacer + 'static,
-        R: AsyncBufRead + Send + Sync + 'static,
-    > Attack<C, P, R>
-{
+impl<C, P: Pacer> Attack<C, P> {
+    pub fn builder(
+        name: impl Into<Arc<str>>,
+        client: Client<C>,
+        pacer: Arc<P>,
+        targets: Arc<Mutex<Targets>>,
+    ) -> AttackBuilder<C, P> {
+        AttackBuilder {
+            name: name.into(),
+            client,
+            pacer,
+            targets,
+            duration: Duration::ZERO,
+            workers: num_cpus::get(),
+            max_workers: 0,
+            timeout: Duration::from_secs(30),
+            max_body: -1,
+            redirects: 10,
+            chunked: false,
+            stop: CancellationToken::new(),
+        }
+    }
+}
+
+pub struct AttackBuilder<C, P: Pacer> {
+    name: Arc<str>,
+    client: Client<C>,
+    duration: Duration,
+    pacer: Arc<P>,
+    targets: Arc<Mutex<Targets>>,
+    workers: usize,
+    max_workers: usize,
+    timeout: Duration,
+    max_body: i64,
+    redirects: i32,
+    chunked: bool,
+    stop: CancellationToken,
+}
+
+impl<C, P: Pacer> AttackBuilder<C, P> {
+    pub fn duration(mut self, d: Duration) -> Self {
+        self.duration = d;
+        self
+    }
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = n;
+        self
+    }
+    pub fn max_workers(mut self, n: usize) -> Self {
+        self.max_workers = n;
+        self
+    }
+    pub fn timeout(mut self, d: Duration) -> Self {
+        self.timeout = d;
+        self
+    }
+    pub fn max_body(mut self, n: i64) -> Self {
+        self.max_body = n;
+        self
+    }
+    pub fn redirects(mut self, n: i32) -> Self {
+        self.redirects = n;
+        self
+    }
+    pub fn chunked(mut self, b: bool) -> Self {
+        self.chunked = b;
+        self
+    }
+    pub fn stop(mut self, token: CancellationToken) -> Self {
+        self.stop = token;
+        self
+    }
+
+    pub fn build(self) -> Attack<C, P> {
+        Attack {
+            name: self.name,
+            client: self.client,
+            duration: self.duration,
+            pacer: self.pacer,
+            targets: self.targets,
+            workers: self.workers,
+            max_workers: self.max_workers,
+            timeout: self.timeout,
+            max_body: self.max_body,
+            redirects: self.redirects,
+            chunked: self.chunked,
+            stop: self.stop,
+        }
+    }
+}
+
+impl<C: Connect + Clone + Send + Sync + 'static, P: Pacer + 'static> Attack<C, P> {
     pub fn run(&self) -> Pin<Box<impl Stream<Item = eyre::Result<Hit>>>> {
         // Bounded(1) channel acts like Go's unbuffered channel: sends block
         // until a worker is ready to receive, enabling backpressure and
@@ -103,14 +188,10 @@ async fn worker<C: Connect + Clone + Send + Sync + 'static>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attack<
-    C: Connect + Clone + Send + Sync + 'static,
-    P: Pacer,
-    R: AsyncBufRead + Send + Sync,
->(
+async fn attack<C: Connect + Clone + Send + Sync + 'static, P: Pacer>(
     duration: Duration,
     pacer: Arc<P>,
-    targets: Arc<Mutex<Targets<R>>>,
+    targets: Arc<Mutex<Targets>>,
     target_send: async_channel::Sender<(u64, Arc<Target>)>,
     workers: usize,
     max_workers: usize,

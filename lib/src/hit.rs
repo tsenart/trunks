@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use base64_simd::STANDARD;
 use csv::ReaderBuilder;
 use eyre::Result;
@@ -34,24 +33,21 @@ impl Hit {
     }
 }
 
-#[async_trait]
-pub trait Codec {
-    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()>;
-    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit>;
-}
-
 pub struct JsonCodec;
 
-#[async_trait]
-impl Codec for JsonCodec {
-    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
+impl JsonCodec {
+    pub async fn encode<W: AsyncWrite + Unpin + Send>(
+        &self,
+        writer: &mut W,
+        hit: &Hit,
+    ) -> Result<()> {
         writer.write_all(&serde_json::to_vec(hit)?).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
     }
 
-    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
+    pub async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
         let mut buf = Vec::new();
         reader.read_until(b'\n', &mut buf).await?;
         serde_json::from_slice(&buf).map_err(|e| eyre::eyre!(e))
@@ -60,9 +56,12 @@ impl Codec for JsonCodec {
 
 pub struct CsvCodec;
 
-#[async_trait]
-impl Codec for CsvCodec {
-    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
+impl CsvCodec {
+    pub async fn encode<W: AsyncWrite + Unpin + Send>(
+        &self,
+        writer: &mut W,
+        hit: &Hit,
+    ) -> Result<()> {
         let timestamp = hit
             .timestamp
             .duration_since(UNIX_EPOCH)
@@ -96,7 +95,7 @@ impl Codec for CsvCodec {
         Ok(())
     }
 
-    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
+    pub async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
         let mut line = Vec::new();
         reader.read_until(b'\n', &mut line).await?;
 
@@ -156,9 +155,12 @@ impl Codec for CsvCodec {
 
 pub struct MsgpackCodec;
 
-#[async_trait]
-impl Codec for MsgpackCodec {
-    async fn encode<W: AsyncWrite + Unpin + Send>(&self, writer: &mut W, hit: &Hit) -> Result<()> {
+impl MsgpackCodec {
+    pub async fn encode<W: AsyncWrite + Unpin + Send>(
+        &self,
+        writer: &mut W,
+        hit: &Hit,
+    ) -> Result<()> {
         let data = rmp_serde::to_vec(hit)?;
         let len = (data.len() as u32).to_be_bytes();
         writer.write_all(&len).await?;
@@ -167,7 +169,7 @@ impl Codec for MsgpackCodec {
         Ok(())
     }
 
-    async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
+    pub async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
         use tokio::io::AsyncReadExt;
         const MAX_MSGPACK_FRAME: usize = 64 * 1024 * 1024; // 64MB
         let mut len_buf = [0u8; 4];

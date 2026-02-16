@@ -1,7 +1,7 @@
 use clap::Args;
 use eyre::Result;
 use tokio::io::AsyncWriteExt;
-use trunks::{Codec, CsvCodec, Hit, JsonCodec, MsgpackCodec};
+use trunks::{CsvCodec, Hit, JsonCodec, MsgpackCodec};
 
 use crate::attack::{Input, Output};
 
