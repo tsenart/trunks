@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use trunks::{
@@ -368,7 +370,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         let atk = Attack {
             client,
             duration: opts.duration.into(),
-            name: opts.name.clone(),
+            name: Arc::from(opts.name.as_str()),
             pacer,
             targets,
             workers: opts.workers,
@@ -392,7 +394,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         let atk = Attack {
             client,
             duration: opts.duration.into(),
-            name: opts.name.clone(),
+            name: Arc::from(opts.name.as_str()),
             pacer,
             targets,
             workers: opts.workers,
@@ -417,83 +419,21 @@ pub async fn attack(opts: &Opts) -> Result<()> {
             _ => eyre::bail!("--cert and --key must both be provided for mTLS"),
         };
 
-        let https = if opts.insecure {
-            let mut tls_config = match client_auth {
-                ClientAuth::Cert(certs, key) => rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_single_cert(certs, key)
-                    .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-                ClientAuth::None => rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_no_client_auth(),
-            };
+        let tls_config = build_tls_config(
+            opts.insecure,
+            &opts.root_certs,
+            client_auth,
+            opts.session_tickets,
+        )?;
 
-            if !opts.session_tickets {
-                tls_config.resumption = rustls::client::Resumption::disabled();
-            }
+        let builder = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http();
 
-            let builder = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
-                .https_or_http();
-
-            if opts.http2 {
-                builder.enable_http1().enable_http2().wrap_connector(http)
-            } else {
-                builder.enable_http1().wrap_connector(http)
-            }
+        let https = if opts.http2 {
+            builder.enable_http1().enable_http2().wrap_connector(http)
         } else {
-            let mut tls_config = if opts.root_certs.is_empty() {
-                let mut root_store = rustls::RootCertStore::empty();
-                for cert in rustls_native_certs::load_native_certs()? {
-                    root_store
-                        .add(&rustls::Certificate(cert.0))
-                        .map_err(|e| eyre::eyre!("invalid native root cert: {}", e))?;
-                }
-                let builder = rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_root_certificates(root_store);
-                match client_auth {
-                    ClientAuth::Cert(certs, key) => builder
-                        .with_single_cert(certs, key)
-                        .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-                    ClientAuth::None => builder.with_no_client_auth(),
-                }
-            } else {
-                let mut root_store = rustls::RootCertStore::empty();
-                for path in &opts.root_certs {
-                    let certs = load_certs(path)?;
-                    for cert in certs {
-                        root_store
-                            .add(&cert)
-                            .map_err(|e| eyre::eyre!("invalid root cert in {}: {}", path, e))?;
-                    }
-                }
-                let builder = rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_root_certificates(root_store);
-                match client_auth {
-                    ClientAuth::Cert(certs, key) => builder
-                        .with_single_cert(certs, key)
-                        .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
-                    ClientAuth::None => builder.with_no_client_auth(),
-                }
-            };
-
-            if !opts.session_tickets {
-                tls_config.resumption = rustls::client::Resumption::disabled();
-            }
-
-            let builder = hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
-                .https_or_http();
-
-            if opts.http2 {
-                builder.enable_http1().enable_http2().wrap_connector(http)
-            } else {
-                builder.enable_http1().wrap_connector(http)
-            }
+            builder.enable_http1().wrap_connector(http)
         };
 
         let client = client_builder.build::<_, hyper::Body>(https);
@@ -501,7 +441,7 @@ pub async fn attack(opts: &Opts) -> Result<()> {
         let atk = Attack {
             client,
             duration: opts.duration.into(),
-            name: opts.name.clone(),
+            name: Arc::from(opts.name.as_str()),
             pacer,
             targets,
             workers: opts.workers,
@@ -639,6 +579,23 @@ impl Input {
             }
         }
     }
+
+    /// Detect the encoding format by peeking at the first byte.
+    /// Returns None if the input is empty.
+    pub async fn detect_format(&mut self) -> std::io::Result<Option<&'static str>> {
+        let buf = self.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let first = buf[0];
+        Ok(Some(if first == b'{' {
+            "json"
+        } else if first.is_ascii_graphic() {
+            "csv"
+        } else {
+            "msgpack"
+        }))
+    }
 }
 
 impl AsyncRead for Input {
@@ -741,6 +698,58 @@ fn load_key(path: &str) -> Result<rustls::PrivateKey> {
         .next()
         .map(rustls::PrivateKey)
         .ok_or_else(|| eyre::eyre!("no private key found in {}", path))
+}
+
+fn build_tls_config(
+    insecure: bool,
+    root_cert_paths: &[String],
+    client_auth: ClientAuth,
+    session_tickets: bool,
+) -> Result<rustls::ClientConfig> {
+    let mut tls_config = if insecure {
+        let builder = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier));
+        match client_auth {
+            ClientAuth::Cert(certs, key) => builder
+                .with_single_cert(certs, key)
+                .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
+            ClientAuth::None => builder.with_no_client_auth(),
+        }
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        if root_cert_paths.is_empty() {
+            for cert in rustls_native_certs::load_native_certs()? {
+                root_store
+                    .add(&rustls::Certificate(cert.0))
+                    .map_err(|e| eyre::eyre!("invalid native root cert: {}", e))?;
+            }
+        } else {
+            for path in root_cert_paths {
+                let certs = load_certs(path)?;
+                for cert in certs {
+                    root_store
+                        .add(&cert)
+                        .map_err(|e| eyre::eyre!("invalid root cert in {}: {}", path, e))?;
+                }
+            }
+        }
+        let builder = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store);
+        match client_auth {
+            ClientAuth::Cert(certs, key) => builder
+                .with_single_cert(certs, key)
+                .map_err(|e| eyre::eyre!("invalid client cert/key: {}", e))?,
+            ClientAuth::None => builder.with_no_client_auth(),
+        }
+    };
+
+    if !session_tickets {
+        tls_config.resumption = rustls::client::Resumption::disabled();
+    }
+
+    Ok(tls_config)
 }
 
 struct NoVerifier;

@@ -1,6 +1,5 @@
 use clap::Args;
 use eyre::Result;
-use tokio::io::AsyncBufReadExt;
 use trunks::{Codec, CsvCodec, JsonCodec, MsgpackCodec};
 
 use crate::attack::{Input, Output};
@@ -32,17 +31,8 @@ pub async fn encode(opts: &Opts) -> Result<()> {
         let mut input = Input::from_filename(source).await?;
 
         // Auto-detect input encoding by peeking at first byte.
-        let buf = input.fill_buf().await?;
-        if buf.is_empty() {
+        let Some(input_format) = input.detect_format().await? else {
             continue;
-        }
-        let first = buf[0];
-        let input_format = if first == b'{' {
-            "json"
-        } else if first.is_ascii_graphic() {
-            "csv"
-        } else {
-            "msgpack"
         };
 
         loop {
@@ -57,7 +47,17 @@ pub async fn encode(opts: &Opts) -> Result<()> {
                     "msgpack" => MsgpackCodec.encode(&mut output, &hit).await?,
                     _ => JsonCodec.encode(&mut output, &hit).await?,
                 },
-                Err(_) => break,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("EOF")
+                        && !msg.contains("eof")
+                        && !msg.contains("empty")
+                        && !msg.contains("no CSV record")
+                    {
+                        eprintln!("Error decoding {}: {}", source, e);
+                    }
+                    break;
+                }
             }
         }
     }

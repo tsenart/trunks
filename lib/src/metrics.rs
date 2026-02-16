@@ -1,11 +1,23 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use tdigest::TDigest;
 
 use crate::hit::duration_as_nanos;
 use crate::Hit;
+
+fn serialize_status_codes<S>(codes: &BTreeMap<u16, u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut map = serializer.serialize_map(Some(codes.len()))?;
+    for (k, v) in codes {
+        map.serialize_entry(&k.to_string(), v)?;
+    }
+    map.end()
+}
 
 #[derive(Debug, Serialize)]
 pub struct Metrics {
@@ -26,12 +38,15 @@ pub struct Metrics {
     pub rate: f64,
     pub throughput: f64,
     pub success: f64,
-    pub status_codes: BTreeMap<String, u64>,
+    #[serde(serialize_with = "serialize_status_codes")]
+    pub status_codes: BTreeMap<u16, u64>,
     pub errors: Vec<String>,
     #[serde(skip)]
     errors_set: HashSet<String>,
     #[serde(skip)]
     success_count: u64,
+    #[serde(skip)]
+    closed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +124,7 @@ impl Metrics {
             errors: Vec::new(),
             errors_set: HashSet::new(),
             success_count: 0,
+            closed: false,
         }
     }
 
@@ -145,8 +161,7 @@ impl Metrics {
         self.bytes_out.total += hit.bytes_out;
 
         // Status codes.
-        let code_str = hit.code.to_string();
-        *self.status_codes.entry(code_str).or_insert(0) += 1;
+        *self.status_codes.entry(hit.code).or_insert(0) += 1;
 
         // Success = status in [200, 400).
         if (200..400).contains(&hit.code) {
@@ -160,9 +175,10 @@ impl Metrics {
     }
 
     pub fn close(&mut self) {
-        if self.requests == 0 {
+        if self.requests == 0 || self.closed {
             return;
         }
+        self.closed = true;
 
         // Fix min if no hits were added (shouldn't happen given the guard above).
         if self.latencies.min == Duration::MAX {
@@ -170,7 +186,7 @@ impl Metrics {
         }
 
         // Mean latency.
-        self.latencies.mean = self.latencies.total / self.requests as u32;
+        self.latencies.mean = self.latencies.total.div_f64(self.requests as f64);
 
         // Build t-digest and compute quantiles.
         let td = TDigest::new_with_size(100);
@@ -264,7 +280,7 @@ mod tests {
         assert_eq!(m.bytes_out.total, 64);
         assert_eq!(m.latencies.min, Duration::from_millis(100));
         assert_eq!(m.latencies.max, Duration::from_millis(100));
-        assert_eq!(m.status_codes.get("200"), Some(&1));
+        assert_eq!(m.status_codes.get(&200), Some(&1));
     }
 
     #[test]
@@ -291,10 +307,10 @@ mod tests {
         m.add(&make_hit(404, 10, 0, 0, "", 1003));
         m.add(&make_hit(500, 10, 0, 0, "", 1004));
         m.close();
-        assert_eq!(m.status_codes.get("200"), Some(&2));
-        assert_eq!(m.status_codes.get("301"), Some(&1));
-        assert_eq!(m.status_codes.get("404"), Some(&1));
-        assert_eq!(m.status_codes.get("500"), Some(&1));
+        assert_eq!(m.status_codes.get(&200), Some(&2));
+        assert_eq!(m.status_codes.get(&301), Some(&1));
+        assert_eq!(m.status_codes.get(&404), Some(&1));
+        assert_eq!(m.status_codes.get(&500), Some(&1));
         // Success = [200,400): 200, 200, 301 = 3/5
         assert!((m.success - 0.6).abs() < 1e-9);
     }
@@ -330,5 +346,45 @@ mod tests {
         m.add(&make_hit(200, 10, 200, 0, "", 1001));
         m.close();
         assert!((m.bytes_in.mean - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_does_not_panic_with_large_request_count() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 10, 0, 0, "", 1000));
+        // Simulate a request count that exceeds u32::MAX.
+        m.requests = u64::from(u32::MAX) + 1;
+        m.latencies.total = Duration::from_millis(100);
+        m.latencies.latencies.push(10_000_000.0); // 10ms in nanos
+                                                  // This must not panic (the old code would truncate to 0 and divide-by-zero).
+        m.close();
+        // 100ms / ~4B requests ≈ 0.023ns, rounds to 0 — that's fine,
+        // the key property is it doesn't panic.
+        assert!(m.latencies.mean <= m.latencies.total);
+    }
+
+    #[test]
+    fn close_is_idempotent() {
+        let mut m = Metrics::new();
+        m.add(&make_hit(200, 50, 100, 0, "", 1000));
+        m.add(&make_hit(200, 100, 200, 0, "", 2000));
+        m.close();
+        let p50_first = m.latencies.p50;
+        let p99_first = m.latencies.p99;
+        assert!(
+            p50_first > Duration::ZERO,
+            "first close should compute percentiles"
+        );
+
+        // Second close should produce identical results, not zero percentiles
+        m.close();
+        assert_eq!(
+            m.latencies.p50, p50_first,
+            "second close should not change p50"
+        );
+        assert_eq!(
+            m.latencies.p99, p99_first,
+            "second close should not change p99"
+        );
     }
 }

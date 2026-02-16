@@ -62,6 +62,7 @@ impl PrometheusMetrics {
         for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
             if latency_s <= bound {
                 m.latency_buckets[i] += 1;
+                break;
             }
         }
         m.bytes_in += hit.bytes_in;
@@ -246,6 +247,27 @@ mod tests {
         assert!(out.contains(r#"method="POST""#));
         assert!(out.contains(r#"url="http://a/""#));
         assert!(out.contains(r#"url="http://b/""#));
+    }
+
+    #[test]
+    fn prometheus_non_cumulative_storage() {
+        let mut pm = PrometheusMetrics::new();
+        // 10ms = 0.01s, 100ms = 0.1s
+        pm.update(&make_hit("GET", "http://x/", 200, 10, 0, 0, ""));
+        pm.update(&make_hit("GET", "http://x/", 200, 100, 0, 0, ""));
+        let out = pm.render();
+        // le="0.005" should be 0 (neither hit fits)
+        assert!(
+            out.contains(r#"le="0.005"} 0"#),
+            "le=0.005 should be 0:\n{out}"
+        );
+        // le="0.01" should be exactly 1 (only the 10ms hit)
+        assert!(
+            out.contains(r#"le="0.01"} 1"#),
+            "le=0.01 should be 1:\n{out}"
+        );
+        // le="0.1" should be exactly 2 (cumulative: both hits)
+        assert!(out.contains(r#"le="0.1"} 2"#), "le=0.1 should be 2:\n{out}");
     }
 
     #[test]

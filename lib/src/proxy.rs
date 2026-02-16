@@ -228,13 +228,20 @@ where
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         stream.write_all(connect_req.as_bytes()).await?;
 
-                        // Read CONNECT response
+                        // Read CONNECT response using buffered reads
                         let mut buf = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 512];
                         loop {
-                            let mut byte = [0u8; 1];
-                            stream.read_exact(&mut byte).await?;
-                            buf.push(byte[0]);
-                            if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+                            let n = stream.read(&mut chunk).await?;
+                            if n == 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "proxy CONNECT response truncated",
+                                )
+                                .into());
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.len() >= 4 && buf.windows(4).any(|w| w == b"\r\n\r\n") {
                                 break;
                             }
                             if buf.len() > 8192 {

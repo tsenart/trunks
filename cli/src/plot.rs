@@ -1,6 +1,6 @@
 use clap::Args;
 use eyre::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use trunks::{Codec, CsvCodec, Hit, JsonCodec, MsgpackCodec};
 
 use crate::attack::{Input, Output};
@@ -8,7 +8,7 @@ use crate::attack::{Input, Output};
 #[derive(Args, Debug)]
 pub struct Opts {
     /// Plot title
-    #[clap(long, default_value = "Vegeta Plot")]
+    #[clap(long, default_value = "Trunks Plot")]
     title: String,
 
     /// Output file [default: stdout]
@@ -33,17 +33,8 @@ pub async fn plot(opts: &Opts) -> Result<()> {
     let mut hits: Vec<Hit> = Vec::new();
     for source in &sources {
         let mut input = Input::from_filename(source).await?;
-        let buf = input.fill_buf().await?;
-        if buf.is_empty() {
+        let Some(input_format) = input.detect_format().await? else {
             continue;
-        }
-        let first = buf[0];
-        let input_format = if first == b'{' {
-            "json"
-        } else if first.is_ascii_graphic() {
-            "csv"
-        } else {
-            "msgpack"
         };
         loop {
             let result = match input_format {
@@ -53,7 +44,17 @@ pub async fn plot(opts: &Opts) -> Result<()> {
             };
             match result {
                 Ok(hit) => hits.push(hit),
-                Err(_) => break,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("EOF")
+                        && !msg.contains("eof")
+                        && !msg.contains("empty")
+                        && !msg.contains("no CSV record")
+                    {
+                        eprintln!("Error decoding {}: {}", source, e);
+                    }
+                    break;
+                }
             }
         }
     }

@@ -1,7 +1,7 @@
 use clap::Args;
 use duration_string::DurationString;
 use eyre::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use trunks::{Codec, CsvCodec, Histogram, JsonCodec, Metrics, MsgpackCodec};
 
 use crate::attack::{Input, Output};
@@ -51,17 +51,8 @@ pub async fn report(opts: &Opts) -> Result<()> {
 
         for source in &sources {
             let mut input = Input::from_filename(source).await?;
-            let buf = input.fill_buf().await?;
-            if buf.is_empty() {
+            let Some(input_format) = input.detect_format().await? else {
                 continue;
-            }
-            let first = buf[0];
-            let input_format = if first == b'{' {
-                "json"
-            } else if first.is_ascii_graphic() {
-                "csv"
-            } else {
-                "msgpack"
             };
 
             let mut done = false;
@@ -82,7 +73,13 @@ pub async fn report(opts: &Opts) -> Result<()> {
                                 }
                                 metrics.add(&hit);
                             }
-                            Err(_) => { done = true; }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if !msg.contains("EOF") && !msg.contains("eof") && !msg.contains("empty") && !msg.contains("no CSV record") {
+                                    eprintln!("Error decoding {}: {}", source, e);
+                                }
+                                done = true;
+                            }
                         }
                     }
                 }
@@ -93,24 +90,30 @@ pub async fn report(opts: &Opts) -> Result<()> {
     } else {
         for source in &sources {
             let mut input = Input::from_filename(source).await?;
-            let buf = input.fill_buf().await?;
-            if buf.is_empty() {
+            let Some(input_format) = input.detect_format().await? else {
                 continue;
-            }
-            let first = buf[0];
-            let input_format = if first == b'{' {
-                "json"
-            } else if first.is_ascii_graphic() {
-                "csv"
-            } else {
-                "msgpack"
             };
 
-            while let Ok(hit) = decode_hit(&mut input, input_format).await {
-                if let Some(ref mut h) = histogram {
-                    h.add(&hit);
+            loop {
+                match decode_hit(&mut input, input_format).await {
+                    Ok(hit) => {
+                        if let Some(ref mut h) = histogram {
+                            h.add(&hit);
+                        }
+                        metrics.add(&hit);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("EOF")
+                            && !msg.contains("eof")
+                            && !msg.contains("empty")
+                            && !msg.contains("no CSV record")
+                        {
+                            eprintln!("Error decoding {}: {}", source, e);
+                        }
+                        break;
+                    }
                 }
-                metrics.add(&hit);
             }
         }
         write_report(opts, &mut metrics, &mut histogram, &mut output).await

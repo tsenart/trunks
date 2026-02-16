@@ -73,6 +73,7 @@ pub struct TargetDefaults {
 pub struct TargetReaderInner<R: AsyncBufRead> {
     input: Pin<Box<R>>,
     defaults: TargetDefaults,
+    body_cache: HashMap<String, Bytes>,
 }
 
 impl<R: AsyncBufRead> TargetReaderInner<R> {
@@ -80,6 +81,7 @@ impl<R: AsyncBufRead> TargetReaderInner<R> {
         TargetReaderInner {
             input: Box::pin(input),
             defaults,
+            body_cache: HashMap::new(),
         }
     }
 }
@@ -106,7 +108,9 @@ impl<R: AsyncBufRead + Send> TargetRead<R> for TargetReader<R> {
     async fn decode(&mut self) -> Result<Arc<Target>> {
         match self {
             TargetReader::Json(tr) => decode_json(&mut tr.input, &tr.defaults).await,
-            TargetReader::Http(tr) => decode_http(&mut tr.input, &tr.defaults).await,
+            TargetReader::Http(tr) => {
+                decode_http(&mut tr.input, &tr.defaults, &mut tr.body_cache).await
+            }
         }
     }
 }
@@ -175,6 +179,7 @@ async fn decode_json<R: AsyncBufReadExt + Unpin>(
 async fn decode_http<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     defaults: &TargetDefaults,
+    body_cache: &mut HashMap<String, Bytes>,
 ) -> eyre::Result<Arc<Target>> {
     let mut line = String::new();
 
@@ -218,7 +223,13 @@ async fn decode_http<R: AsyncBufReadExt + Unpin>(
             break;
         }
         if let Some(body_path) = trimmed.strip_prefix('@') {
-            body = Bytes::from(tokio::fs::read(body_path).await?);
+            body = if let Some(cached) = body_cache.get(body_path) {
+                cached.clone()
+            } else {
+                let data = Bytes::from(tokio::fs::read(body_path).await?);
+                body_cache.insert(body_path.to_string(), data.clone());
+                data
+            };
             break;
         }
         let tokens: Vec<&str> = line.splitn(2, ':').collect();
@@ -344,5 +355,37 @@ mod tests {
         let mut tr = TargetReader::new("http", reader, TargetDefaults::default()).unwrap();
         let target = tr.decode().await.unwrap();
         assert_eq!(target.method, Method::GET);
+    }
+
+    #[tokio::test]
+    async fn http_body_path_cached_after_first_read() {
+        let dir = std::env::temp_dir().join("trunks_test_body_cache");
+        let _ = std::fs::create_dir_all(&dir);
+        let body_file = dir.join("payload.json");
+        std::fs::write(&body_file, b"original").unwrap();
+
+        // Two targets referencing the same @body_path
+        let body_path = body_file.to_str().unwrap();
+        let input = format!(
+            "POST http://a.com/\n@{}\n\nPOST http://b.com/\n@{}\n\n",
+            body_path, body_path
+        );
+        let reader = BufReader::new(input.as_bytes());
+        let mut tr = TargetReader::new("http", reader, TargetDefaults::default()).unwrap();
+
+        let t1 = tr.decode().await.unwrap();
+        assert_eq!(t1.body.as_ref(), b"original");
+
+        // Overwrite the file between reads — second decode should use cached content
+        std::fs::write(&body_file, b"modified").unwrap();
+
+        let t2 = tr.decode().await.unwrap();
+        assert_eq!(
+            t2.body.as_ref(),
+            b"original",
+            "second read should use cached body, not re-read file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

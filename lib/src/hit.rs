@@ -169,9 +169,17 @@ impl Codec for MsgpackCodec {
 
     async fn decode<R: AsyncBufRead + Unpin + Send>(&self, reader: &mut R) -> Result<Hit> {
         use tokio::io::AsyncReadExt;
+        const MAX_MSGPACK_FRAME: usize = 64 * 1024 * 1024; // 64MB
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MSGPACK_FRAME {
+            eyre::bail!(
+                "msgpack frame too large: {} bytes (max {})",
+                len,
+                MAX_MSGPACK_FRAME
+            );
+        }
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data).await?;
         rmp_serde::from_slice(&data).map_err(|e| eyre::eyre!(e))
@@ -186,7 +194,7 @@ pub mod duration_as_nanos {
     where
         S: Serializer,
     {
-        let nanos = duration.as_nanos() as u64;
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         serializer.serialize_u64(nanos)
     }
 
@@ -447,6 +455,47 @@ mod tests {
 
         assert_eq!(decoded.error, "timeout: \"dial tcp\"");
     }
+
+    #[tokio::test]
+    async fn msgpack_decode_rejects_oversized_length() {
+        // A malicious/corrupted input with length prefix = 128MB should be rejected.
+        let huge_len: u32 = 128 * 1024 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&huge_len.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 64]); // some garbage data
+        let mut reader = &buf[..];
+        let result = MsgpackCodec.decode(&mut reader).await;
+        assert!(
+            result.is_err(),
+            "should reject msgpack frame with 128MB length prefix"
+        );
+    }
+
+    #[test]
+    fn duration_as_nanos_saturates_instead_of_wrapping() {
+        // Duration > u64::MAX nanos (~584 years) should saturate to u64::MAX
+        let huge = Duration::new(u64::MAX / 1_000_000_000 + 1, 0);
+        assert!(
+            huge.as_nanos() > u64::MAX as u128,
+            "test precondition: duration must exceed u64 range"
+        );
+        let json = serde_json::to_string(&huge.as_nanos()).unwrap();
+        // Serialize through our module
+        #[derive(serde::Serialize)]
+        struct Wrapper {
+            #[serde(serialize_with = "duration_as_nanos::serialize")]
+            d: Duration,
+        }
+        let w = Wrapper { d: huge };
+        let serialized = serde_json::to_string(&w).unwrap();
+        // Should contain u64::MAX, not a truncated/wrapped value
+        assert!(
+            serialized.contains(&u64::MAX.to_string()),
+            "expected u64::MAX saturation, got: {}",
+            serialized
+        );
+        let _ = json; // suppress unused
+    }
 }
 
 fn headers_to_mime_base64(headers: &HashMap<String, Vec<String>>) -> String {
@@ -496,7 +545,7 @@ mod bytes_as_base64 {
     use serde::de::Error;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {

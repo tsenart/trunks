@@ -15,7 +15,7 @@ pub struct PlotOpts {
 impl Default for PlotOpts {
     fn default() -> Self {
         PlotOpts {
-            title: "Vegeta Plot".to_string(),
+            title: "Trunks Plot".to_string(),
             threshold: 4000,
         }
     }
@@ -336,7 +336,7 @@ mod tests {
         let html = String::from_utf8(buf).unwrap();
         assert!(html.contains("<!doctype html>"));
         assert!(html.contains("</html>"));
-        assert!(html.contains("Vegeta Plot"));
+        assert!(html.contains("Trunks Plot"));
     }
 
     #[test]

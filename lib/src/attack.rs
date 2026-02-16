@@ -1,5 +1,5 @@
 use futures::Stream;
-use hyper::body::to_bytes;
+use hyper::body::HttpBody;
 use hyper::client::connect::Connect;
 use hyper::{Body, Client, Method, Request, Uri};
 use std::collections::HashMap;
@@ -17,9 +17,18 @@ use crate::hit::Hit;
 use crate::pacer::Pacer;
 use crate::target::{Target, TargetRead, Targets};
 
+#[derive(Debug, Clone)]
+struct HitConfig {
+    name: Arc<str>,
+    timeout: Duration,
+    max_body: i64,
+    redirects: i32,
+    chunked: bool,
+}
+
 #[derive(Debug)]
 pub struct Attack<C, P: Pacer, R: AsyncBufRead + Send> {
-    pub name: String,
+    pub name: Arc<str>,
     pub client: Client<C>,
     pub duration: Duration,
     pub pacer: Arc<P>,
@@ -46,16 +55,20 @@ impl<
         let (target_send, target_recv) = async_channel::bounded::<(u64, Arc<Target>)>(1);
         let (hit_send, hit_recv) = async_channel::unbounded::<eyre::Result<Hit>>();
 
+        let config = HitConfig {
+            name: self.name.clone(),
+            timeout: self.timeout,
+            max_body: self.max_body,
+            redirects: self.redirects,
+            chunked: self.chunked,
+        };
+
         for _ in 0..self.workers {
             tokio::spawn(worker(
                 target_recv.clone(),
                 hit_send.clone(),
                 self.client.clone(),
-                self.name.clone(),
-                self.timeout,
-                self.max_body,
-                self.redirects,
-                self.chunked,
+                config.clone(),
             ));
         }
 
@@ -69,11 +82,7 @@ impl<
             target_recv,
             hit_send,
             self.client.clone(),
-            self.name.clone(),
-            self.timeout,
-            self.max_body,
-            self.redirects,
-            self.chunked,
+            config,
             self.stop.clone(),
         ));
 
@@ -81,29 +90,14 @@ impl<
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn worker<C: Connect + Clone + Send + Sync + 'static>(
     target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
     client: hyper::Client<C>,
-    name: String,
-    timeout: Duration,
-    max_body: i64,
-    redirects: i32,
-    chunked: bool,
+    config: HitConfig,
 ) {
     while let Ok((count, target)) = target_recv.recv().await {
-        let result = hit(
-            name.clone(),
-            client.clone(),
-            count,
-            target,
-            timeout,
-            max_body,
-            redirects,
-            chunked,
-        )
-        .await;
+        let result = hit(&config, client.clone(), count, target).await;
         let _ = hit_send.send(result).await;
     }
 }
@@ -123,11 +117,7 @@ async fn attack<
     target_recv: async_channel::Receiver<(u64, Arc<Target>)>,
     hit_send: async_channel::Sender<eyre::Result<Hit>>,
     client: hyper::Client<C>,
-    name: String,
-    timeout: Duration,
-    max_body: i64,
-    redirects: i32,
-    chunked: bool,
+    config: HitConfig,
     stop: CancellationToken,
 ) {
     let mut count: u64 = 0;
@@ -188,11 +178,7 @@ async fn attack<
                         target_recv.clone(),
                         hit_send.clone(),
                         client.clone(),
-                        name.clone(),
-                        timeout,
-                        max_body,
-                        redirects,
-                        chunked,
+                        config.clone(),
                     ));
                     // Fall through to blocking send with the returned pair.
                     let target = pair.1;
@@ -266,78 +252,35 @@ fn authority_of(uri: &Uri) -> String {
         .to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn hit<C: Connect + Clone + Send + Sync + 'static>(
-    attack: String,
+    config: &HitConfig,
     client: hyper::Client<C>,
     seq: u64,
     target: Arc<Target>,
-    timeout: Duration,
-    max_body: i64,
-    redirects: i32,
-    chunked: bool,
 ) -> eyre::Result<Hit> {
+    let attack = config.name.to_string();
+    let timeout = config.timeout;
+    let max_body = config.max_body;
+    let redirects = config.redirects;
+    let chunked = config.chunked;
     let method = target.method.to_string();
     let url = target.url.to_string();
     let timestamp = SystemTime::now();
     let began = Instant::now();
 
-    let mut current_method = target.method.clone();
-    let mut current_uri = target.url.clone();
-    let mut current_body = target.body.clone();
-    let mut current_headers = target.headers.clone();
-    let mut last_code: u16 = 0;
-    let original_authority = authority_of(&target.url);
+    // Fast path: no redirects to follow — avoid cloning target fields.
+    if redirects <= 0 {
+        let req = build_request(
+            &target.method,
+            &target.url,
+            &target.headers,
+            &target.body,
+            &attack,
+            seq,
+            chunked,
+        )?;
 
-    for redirects_followed in 0..=redirects.max(0) as u32 {
-        let mut req = Request::builder().method(&current_method).uri(&current_uri);
-        if let Some(headers) = req.headers_mut() {
-            *headers = current_headers.clone();
-            if !attack.is_empty() {
-                if let Ok(val) = hyper::header::HeaderValue::from_str(&attack) {
-                    headers.insert(
-                        hyper::header::HeaderName::from_static("x-trunks-attack"),
-                        val,
-                    );
-                }
-            }
-            if let Ok(val) = hyper::header::HeaderValue::from_str(&seq.to_string()) {
-                headers.insert(hyper::header::HeaderName::from_static("x-trunks-seq"), val);
-            }
-        }
-        let body = if chunked && !current_body.is_empty() {
-            let bytes = current_body.clone();
-            Body::wrap_stream(futures::stream::once(async move {
-                Ok::<_, std::io::Error>(bytes)
-            }))
-        } else {
-            Body::from(current_body.clone())
-        };
-        let req = req.body(body)?;
-
-        let res = if timeout.is_zero() {
-            client.request(req).await
-        } else {
-            match tokio::time::timeout(timeout, client.request(req)).await {
-                Ok(res) => res,
-                Err(_) => {
-                    return Ok(Hit {
-                        attack,
-                        seq,
-                        code: 0,
-                        timestamp,
-                        latency: began.elapsed(),
-                        bytes_out: 0,
-                        bytes_in: 0,
-                        error: "request timed out".to_string(),
-                        body: vec![],
-                        method,
-                        url,
-                        headers: HashMap::new(),
-                    })
-                }
-            }
-        };
+        let res = send_request(&client, req, timeout).await;
 
         let res = match res {
             Ok(res) => res,
@@ -350,7 +293,78 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
                     latency: began.elapsed(),
                     bytes_out: 0,
                     bytes_in: 0,
-                    error: err.to_string(),
+                    error: err,
+                    body: vec![],
+                    method,
+                    url,
+                    headers: HashMap::new(),
+                })
+            }
+        };
+
+        let status = res.status();
+        let code = status.as_u16();
+
+        let response_headers: HashMap<String, Vec<String>> =
+            res.headers()
+                .iter()
+                .fold(HashMap::new(), |mut map, (name, value)| {
+                    map.entry(name.as_str().to_string())
+                        .or_default()
+                        .push(value.to_str().unwrap_or("").to_string());
+                    map
+                });
+        let body = read_body(res.into_body(), max_body).await?;
+
+        return Ok(Hit {
+            attack,
+            seq,
+            code,
+            timestamp,
+            latency: began.elapsed(),
+            bytes_out: target.body.len() as u64,
+            bytes_in: body.len() as u64,
+            error: String::default(),
+            body,
+            method,
+            url,
+            headers: response_headers,
+        });
+    }
+
+    // Slow path: may need to follow redirects, clone fields into mutable locals.
+    let mut current_method = target.method.clone();
+    let mut current_uri = target.url.clone();
+    let mut current_body = target.body.clone();
+    let mut current_headers = target.headers.clone();
+    let mut last_code: u16 = 0;
+    let original_authority = authority_of(&target.url);
+
+    for redirects_followed in 0..=redirects as u32 {
+        let req = build_request(
+            &current_method,
+            &current_uri,
+            &current_headers,
+            &current_body,
+            &attack,
+            seq,
+            chunked,
+        )?;
+
+        let res = send_request(&client, req, timeout).await;
+
+        let res = match res {
+            Ok(res) => res,
+            Err(err) => {
+                return Ok(Hit {
+                    attack,
+                    seq,
+                    code: 0,
+                    timestamp,
+                    latency: began.elapsed(),
+                    bytes_out: 0,
+                    bytes_in: 0,
+                    error: err,
                     body: vec![],
                     method,
                     url,
@@ -362,7 +376,7 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
         let status = res.status();
         last_code = status.as_u16();
 
-        if !is_redirect(status) || redirects < 0 {
+        if !is_redirect(status) {
             let response_headers: HashMap<String, Vec<String>> =
                 res.headers()
                     .iter()
@@ -372,10 +386,7 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
                             .push(value.to_str().unwrap_or("").to_string());
                         map
                     });
-            let mut body = to_bytes(res.into_body()).await?.to_vec();
-            if max_body >= 0 {
-                body.truncate(max_body as usize);
-            }
+            let body = read_body(res.into_body(), max_body).await?;
 
             return Ok(Hit {
                 attack,
@@ -394,19 +405,19 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
         }
 
         if redirects_followed == redirects as u32 {
-            let _ = to_bytes(res.into_body()).await?;
+            drain_body(res.into_body()).await?;
             break;
         }
 
         let location = match res.headers().get(hyper::header::LOCATION) {
             Some(loc) => loc.to_str()?.to_string(),
             None => {
-                let _ = to_bytes(res.into_body()).await?;
+                drain_body(res.into_body()).await?;
                 break;
             }
         };
 
-        let _ = to_bytes(res.into_body()).await?;
+        drain_body(res.into_body()).await?;
 
         current_uri = resolve_redirect(&current_uri, &location)?;
 
@@ -450,6 +461,92 @@ async fn hit<C: Connect + Clone + Send + Sync + 'static>(
     })
 }
 
+/// Read body from a hyper response, streaming chunk-by-chunk.
+/// If `max_body >= 0`, accumulates at most `max_body` bytes and discards the rest.
+/// If `max_body < 0`, reads the entire body.
+async fn read_body(mut body: Body, max_body: i64) -> eyre::Result<Vec<u8>> {
+    let limit = if max_body >= 0 {
+        Some(max_body as usize)
+    } else {
+        None
+    };
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        match limit {
+            Some(limit) => {
+                let remaining = limit.saturating_sub(buf.len());
+                if remaining == 0 {
+                    // Already at limit — drain remaining chunks without storing.
+                    continue;
+                }
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            None => buf.extend_from_slice(&chunk),
+        }
+    }
+    Ok(buf)
+}
+
+/// Drain a response body without accumulating it.
+async fn drain_body(mut body: Body) -> eyre::Result<()> {
+    while let Some(chunk) = body.data().await {
+        let _ = chunk?;
+    }
+    Ok(())
+}
+
+fn build_request(
+    method: &Method,
+    uri: &Uri,
+    headers: &hyper::header::HeaderMap,
+    body: &hyper::body::Bytes,
+    attack: &str,
+    seq: u64,
+    chunked: bool,
+) -> eyre::Result<Request<Body>> {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(h) = req.headers_mut() {
+        *h = headers.clone();
+        if !attack.is_empty() {
+            if let Ok(val) = hyper::header::HeaderValue::from_str(attack) {
+                h.insert(
+                    hyper::header::HeaderName::from_static("x-trunks-attack"),
+                    val,
+                );
+            }
+        }
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&seq.to_string()) {
+            h.insert(hyper::header::HeaderName::from_static("x-trunks-seq"), val);
+        }
+    }
+    let req_body = if chunked && !body.is_empty() {
+        let bytes = body.clone();
+        Body::wrap_stream(futures::stream::once(async move {
+            Ok::<_, std::io::Error>(bytes)
+        }))
+    } else {
+        Body::from(body.clone())
+    };
+    Ok(req.body(req_body)?)
+}
+
+async fn send_request<C: Connect + Clone + Send + Sync + 'static>(
+    client: &hyper::Client<C>,
+    req: Request<Body>,
+    timeout: Duration,
+) -> Result<hyper::Response<Body>, String> {
+    if timeout.is_zero() {
+        client.request(req).await.map_err(|e| e.to_string())
+    } else {
+        match tokio::time::timeout(timeout, client.request(req)).await {
+            Ok(res) => res.map_err(|e| e.to_string()),
+            Err(_) => Err("request timed out".to_string()),
+        }
+    }
+}
+
 fn resolve_redirect(base: &Uri, location: &str) -> eyre::Result<Uri> {
     let base_url = Url::parse(&base.to_string())
         .map_err(|e| eyre::eyre!("invalid base URL {:?}: {}", base, e))?;
@@ -457,4 +554,82 @@ fn resolve_redirect(base: &Uri, location: &str) -> eyre::Result<Uri> {
         .join(location)
         .map_err(|e| eyre::eyre!("invalid redirect location {:?}: {}", location, e))?;
     Ok(resolved.as_str().parse::<Uri>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_body_truncates_to_max_body() {
+        // Create a body with 10 bytes delivered in two 5-byte chunks.
+        let (mut sender, body) = Body::channel();
+        let handle = tokio::spawn(async move {
+            sender
+                .send_data(hyper::body::Bytes::from(vec![b'A'; 5]))
+                .await
+                .unwrap();
+            sender
+                .send_data(hyper::body::Bytes::from(vec![b'B'; 5]))
+                .await
+                .unwrap();
+            // Drop sender to signal EOF.
+        });
+
+        // max_body = 3: should only get the first 3 bytes.
+        let result = read_body(body, 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, vec![b'A'; 3]);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_body_truncates_across_chunk_boundary() {
+        // Two chunks of 4 bytes each, limit of 6 — spans both chunks.
+        let (mut sender, body) = Body::channel();
+        let handle = tokio::spawn(async move {
+            sender
+                .send_data(hyper::body::Bytes::from(vec![1u8; 4]))
+                .await
+                .unwrap();
+            sender
+                .send_data(hyper::body::Bytes::from(vec![2u8; 4]))
+                .await
+                .unwrap();
+        });
+
+        let result = read_body(body, 6).await.unwrap();
+        assert_eq!(result.len(), 6);
+        assert_eq!(&result[..4], &[1u8; 4]);
+        assert_eq!(&result[4..6], &[2u8; 2]);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_body_no_limit() {
+        let body = Body::from(vec![b'X'; 100]);
+        let result = read_body(body, -1).await.unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn read_body_zero_limit() {
+        let body = Body::from(vec![b'X'; 100]);
+        let result = read_body(body, 0).await.unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_body_limit_larger_than_body() {
+        let body = Body::from(vec![b'Y'; 10]);
+        let result = read_body(body, 1000).await.unwrap();
+        assert_eq!(result.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn drain_body_consumes_without_accumulating() {
+        let body = Body::from(vec![b'Z'; 1000]);
+        drain_body(body).await.unwrap();
+        // If we get here without OOM or error, it works.
+    }
 }

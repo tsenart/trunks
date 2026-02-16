@@ -141,8 +141,7 @@ pub fn report_text(m: &Metrics, w: &mut dyn Write) -> eyre::Result<()> {
         m.success * 100.0,
     )?;
 
-    let mut codes: Vec<_> = m.status_codes.keys().collect();
-    codes.sort();
+    let codes: Vec<_> = m.status_codes.keys().collect();
     for code in codes {
         let count = m.status_codes[code];
         write!(tw, "{}:{}  ", code, count)?;

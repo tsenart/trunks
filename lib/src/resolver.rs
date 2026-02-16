@@ -2,7 +2,7 @@ use hyper::client::connect::dns::Name;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -118,7 +118,8 @@ fn normalize_resolver_addr(s: &str) -> Option<SocketAddr> {
 }
 
 /// Build a DNS query packet for the given name and query type (A=1, AAAA=28).
-fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
+/// Returns (query_bytes, transaction_id).
+fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
     let mut buf = Vec::with_capacity(512);
     // Header
@@ -136,15 +137,26 @@ fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
     buf.push(0); // root label
     buf.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
     buf.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
-    buf
+    (buf, id)
 }
 
 /// Parse a DNS response and extract IP addresses from answer records.
-fn parse_dns_response(resp: &[u8]) -> io::Result<Vec<IpAddr>> {
+/// Validates the transaction ID matches the expected query ID.
+fn parse_dns_response(resp: &[u8], expected_id: u16) -> io::Result<Vec<IpAddr>> {
     if resp.len() < 12 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS response too short",
+        ));
+    }
+    let resp_id = u16::from_be_bytes([resp[0], resp[1]]);
+    if resp_id != expected_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "DNS transaction ID mismatch: expected {}, got {}",
+                expected_id, resp_id
+            ),
         ));
     }
     let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
@@ -222,29 +234,32 @@ fn skip_dns_name(resp: &[u8], mut pos: usize) -> io::Result<usize> {
     Ok(pos)
 }
 
-/// Resolve a hostname using a custom DNS server via UDP.
+/// Resolve a hostname using a custom DNS server via async UDP.
 /// Sends both A and AAAA queries and combines results.
-fn dns_resolve(name: &str, server_addr: SocketAddr) -> io::Result<Vec<IpAddr>> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    socket.connect(server_addr)?;
+async fn dns_resolve_async(name: &str, server_addr: SocketAddr) -> io::Result<Vec<IpAddr>> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(server_addr).await?;
 
     let mut all_addrs = Vec::new();
 
     // A query
-    let query = build_dns_query(name, 1);
-    socket.send(&query)?;
+    let (query, query_id) = build_dns_query(name, 1);
+    socket.send(&query).await?;
     let mut resp = [0u8; 4096];
-    let len = socket.recv(&mut resp)?;
-    if let Ok(addrs) = parse_dns_response(&resp[..len]) {
+    let len = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut resp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))??;
+    if let Ok(addrs) = parse_dns_response(&resp[..len], query_id) {
         all_addrs.extend(addrs);
     }
 
     // AAAA query
-    let query = build_dns_query(name, 28);
-    socket.send(&query)?;
-    let len = socket.recv(&mut resp)?;
-    if let Ok(addrs) = parse_dns_response(&resp[..len]) {
+    let (query, query_id) = build_dns_query(name, 28);
+    socket.send(&query).await?;
+    let len = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut resp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS AAAA query timed out"))??;
+    if let Ok(addrs) = parse_dns_response(&resp[..len], query_id) {
         all_addrs.extend(addrs);
     }
 
@@ -306,10 +321,7 @@ impl Service<Name> for TrunksResolver {
             let addrs: Vec<SocketAddr> = if !resolvers.is_empty() {
                 let idx = resolver_idx.fetch_add(1, Ordering::Relaxed) % resolvers.len();
                 let server = resolvers[idx];
-                let host_clone = host.clone();
-                let ips = tokio::task::spawn_blocking(move || dns_resolve(&host_clone, server))
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+                let ips = dns_resolve_async(&host, server).await?;
                 ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()
             } else {
                 let host_clone = host.clone();
@@ -387,8 +399,10 @@ mod tests {
 
     #[test]
     fn build_dns_query_structure() {
-        let q = build_dns_query("example.com", 1);
+        let (q, id) = build_dns_query("example.com", 1);
         assert!(q.len() > 12);
+        // ID matches returned value
+        assert_eq!(u16::from_be_bytes([q[0], q[1]]), id);
         // QDCOUNT = 1
         assert_eq!(&q[4..6], &[0x00, 0x01]);
         // ANCOUNT = 0
@@ -409,7 +423,7 @@ mod tests {
 
     #[test]
     fn build_dns_query_aaaa() {
-        let q = build_dns_query("test.io", 28);
+        let (q, _id) = build_dns_query("test.io", 28);
         // Find QTYPE at end: after root label (0), next 2 bytes are QTYPE
         // "test" = 4 bytes + 1 len, "io" = 2 bytes + 1 len, root = 1 byte
         // offset = 12 + 1+4 + 1+2 + 1 = 21, QTYPE at 21..23
@@ -421,7 +435,7 @@ mod tests {
     fn parse_dns_response_a_record() {
         let mut resp = Vec::new();
         // Header
-        resp.extend_from_slice(&[0x00, 0x01]); // ID
+        resp.extend_from_slice(&[0x00, 0x01]); // ID=1
         resp.extend_from_slice(&[0x81, 0x80]); // Flags
         resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
         resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
@@ -443,14 +457,14 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
         resp.extend_from_slice(&[1, 2, 3, 4]); // RDATA
 
-        let addrs = parse_dns_response(&resp).unwrap();
+        let addrs = parse_dns_response(&resp, 1).unwrap();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
     }
 
     #[test]
     fn parse_dns_response_too_short() {
-        assert!(parse_dns_response(&[0u8; 5]).is_err());
+        assert!(parse_dns_response(&[0u8; 5], 0).is_err());
     }
 
     #[test]
@@ -467,5 +481,109 @@ mod tests {
         let data = [0xC0, 0x0C];
         let pos = skip_dns_name(&data, 0).unwrap();
         assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn parse_dns_response_validates_transaction_id() {
+        // Build a DNS query so we know the expected ID
+        let (_query, expected_id) = build_dns_query("example.com", 1);
+
+        // Build a valid A-record response but with a WRONG transaction ID
+        let wrong_id = expected_id.wrapping_add(1);
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&wrong_id.to_be_bytes()); // Wrong ID
+        resp.extend_from_slice(&[0x81, 0x80]); // Flags
+        resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+        resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+                                               // Question: example.com
+        resp.push(7);
+        resp.extend_from_slice(b"example");
+        resp.push(3);
+        resp.extend_from_slice(b"com");
+        resp.push(0);
+        resp.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+                                               // Answer
+        resp.extend_from_slice(&[0xC0, 0x0C]); // Compressed name
+        resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL
+        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        resp.extend_from_slice(&[1, 2, 3, 4]); // RDATA
+
+        // Should reject: wrong transaction ID
+        let result = parse_dns_response(&resp, expected_id);
+        assert!(
+            result.is_err(),
+            "should reject response with wrong transaction ID"
+        );
+
+        // Should accept: correct transaction ID
+        let mut resp_ok = resp.clone();
+        resp_ok[0..2].copy_from_slice(&expected_id.to_be_bytes());
+        let addrs = parse_dns_response(&resp_ok, expected_id).unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn build_dns_query_returns_unique_ids() {
+        let (_q1, id1) = build_dns_query("a.com", 1);
+        let (_q2, id2) = build_dns_query("b.com", 1);
+        assert_ne!(id1, id2, "each query should have a unique transaction ID");
+    }
+
+    #[tokio::test]
+    async fn async_dns_resolve_uses_tokio_udp() {
+        // This test validates that dns_resolve is async (takes tokio UdpSocket).
+        // We bind a local UDP socket that echoes a valid DNS response,
+        // then call dns_resolve_async to verify it works without spawn_blocking.
+        use tokio::net::UdpSocket as TokioUdpSocket;
+
+        let server = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Spawn a mock DNS server that replies to one A query
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            // Build response: copy query ID, set response flags, 1 answer
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&buf[0..2]); // Copy query ID
+            resp.extend_from_slice(&[0x81, 0x80]); // Response flags
+            resp.extend_from_slice(&buf[4..6]); // QDCOUNT
+            resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT=1
+            resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+            resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+            resp.extend_from_slice(&buf[12..len]); // Copy question
+                                                   // Answer: compressed pointer, A record
+            resp.extend_from_slice(&[0xC0, 0x0C]); // Name pointer
+            resp.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+            resp.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+            resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60
+            resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+            resp.extend_from_slice(&[10, 0, 0, 1]); // 10.0.0.1
+            server.send_to(&resp, peer).await.unwrap();
+
+            // Handle AAAA query too
+            let (len2, peer2) = server.recv_from(&mut buf).await.unwrap();
+            let mut resp2 = Vec::new();
+            resp2.extend_from_slice(&buf[0..2]); // Copy query ID
+            resp2.extend_from_slice(&[0x81, 0x80]); // Response flags
+            resp2.extend_from_slice(&buf[4..6]); // QDCOUNT
+            resp2.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0 (no AAAA)
+            resp2.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+            resp2.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+            resp2.extend_from_slice(&buf[12..len2]); // Copy question
+            server.send_to(&resp2, peer2).await.unwrap();
+        });
+
+        let ips = dns_resolve_async("test.example", server_addr)
+            .await
+            .unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        handle.await.unwrap();
     }
 }

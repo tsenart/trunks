@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 mod attack;
 mod hit;
 pub mod lttb;
@@ -12,14 +13,14 @@ mod target;
 #[cfg(unix)]
 mod unix;
 
-pub use attack::*;
-pub use hit::*;
-pub use metrics::*;
-pub use pacer::*;
+pub use attack::Attack;
+pub use hit::{Codec, CsvCodec, Hit, JsonCodec, MsgpackCodec};
+pub use metrics::{ByteMetrics, LatencyMetrics, Metrics};
+pub use pacer::{ConstantPacer, LinearPacer, Pacer, SinePacer, MEAN_DOWN, MEAN_UP, PEAK, TROUGH};
 pub use prometheus::PrometheusMetrics;
 pub use proxy::{ProxyConfig, ProxyConnector, ProxyStream};
-pub use reporters::*;
-pub use resolver::*;
-pub use target::*;
+pub use reporters::{report_hdrplot, report_histogram, report_json, report_text, Histogram};
+pub use resolver::{Addrs, TrunksResolver};
+pub use target::{Target, TargetDefaults, TargetRead, TargetReader, TargetReaderInner, Targets};
 #[cfg(unix)]
-pub use unix::*;
+pub use unix::{UnixConnector, UnixStream};
