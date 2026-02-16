@@ -73,10 +73,22 @@ CLI (clap)
 ```sh
 cargo build              # Debug build
 cargo build --release    # Release (LTO=fat, codegen-units=1)
-cargo test --all         # Run all 90 tests
+cargo test --all         # Run all tests
 cargo fmt --check        # Verify formatting
-cargo clippy -- -D warnings  # Lint (CI runs this, must pass)
+cargo clippy -- -D warnings  # Lint — CI treats warnings as errors
 ```
+
+### Pre-push checklist
+
+**Run all three before every push.** CI will reject the PR/push if any fail.
+
+```sh
+cargo fmt
+cargo clippy -- -D warnings
+cargo test --all
+```
+
+This is non-negotiable. Don't push and hope CI passes.
 
 ## CI & Release
 
